@@ -13,7 +13,7 @@ A ~110M-parameter Llama-style English and code model, trained from scratch on fr
 
 1. Accept the dataset terms for [bigcode/the-stack-dedup](https://huggingface.co/datasets/bigcode/the-stack-dedup), which is gated.
 2. Create an HF **write** token and a W&B API key.
-3. Push this repo to GitHub, then set `GITHUB_REPO` in the notebooks.
+3. The notebooks clone https://github.com/Dhagash1206/MiniLLM. If you fork it, change `GITHUB_REPO` in each notebook.
 4. In each Kaggle notebook, add these secrets: `HF_TOKEN`, `HF_USERNAME`, `WANDB_API_KEY`. Turn Internet on.
 
 For local development:
