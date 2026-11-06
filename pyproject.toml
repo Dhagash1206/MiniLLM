@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "minillm"
+version = "0.1.0"
+description = "Small Llama-style English + code LLM trained on free GPUs"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.4",
+    "numpy",
+    "datasets>=3.0",
+    "tokenizers>=0.20",
+    "transformers>=5.0",
+    "huggingface_hub>=1.0",
+    "safetensors",
+    "wandb",
+    "pyyaml",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "fastapi", "uvicorn"]
+
+[tool.setuptools.packages.find]
+include = ["MiniLLM*"]
+
+[tool.pytest.ini_options]
+testpaths = ["Tests"]
+python_files = ["*Tests.py"]

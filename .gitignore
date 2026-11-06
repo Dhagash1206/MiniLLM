@@ -1,0 +1,18 @@
+# Environment and tooling
+.venv/
+.env
+.vscode/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+.DS_Store
+
+# Generated outputs (anchored to the repo root: macOS is case-insensitive,
+# so an unanchored "data/" would also hide the MiniLLM/Data/ source package)
+/data/
+/checkpoints*/
+/artifacts/
+/results/
+/wandb/

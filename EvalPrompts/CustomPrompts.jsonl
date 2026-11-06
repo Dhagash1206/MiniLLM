@@ -1,0 +1,10 @@
+{"category": "python", "prompt": "Write a Python function that returns the n-th Fibonacci number iteratively."}
+{"category": "python", "prompt": "Write a Python function to remove duplicates from a list while keeping the original order."}
+{"category": "python", "prompt": "Fix the bug in this code:\n\ndef average(nums):\n    return sum(nums) / len(nums) + 1"}
+{"category": "javascript", "prompt": "Write a JavaScript function that debounces another function by a given number of milliseconds."}
+{"category": "javascript", "prompt": "Convert this callback to async/await:\n\nfs.readFile('a.txt', (err, data) => { if (err) throw err; console.log(data); });"}
+{"category": "sql", "prompt": "Write a SQL query that returns the top 5 customers by total order amount from tables customers(id, name) and orders(id, customer_id, amount)."}
+{"category": "sql", "prompt": "Explain the difference between INNER JOIN and LEFT JOIN with a short example."}
+{"category": "explain", "prompt": "Explain what a Python list comprehension is and give one example."}
+{"category": "english", "prompt": "Summarize the water cycle in three sentences."}
+{"category": "english", "prompt": "What are the main causes of the seasons on Earth?"}

@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>minillm chat</title>
+  <link rel="stylesheet" href="/static/ChatStyles.css">
+</head>
+<body>
+  <header class="top-bar">
+    <div>
+      <h1>minillm-125m</h1>
+      <p class="subtitle">A ~110M-parameter English + code model trained from scratch on free GPUs.</p>
+    </div>
+    <button id="settings-toggle" class="ghost-button" type="button" aria-expanded="false" aria-controls="settings-panel">Settings</button>
+  </header>
+
+  <section id="settings-panel" class="settings" hidden>
+    <label>System prompt
+      <textarea id="system-prompt" rows="2" placeholder="Optional, e.g. You are a concise coding assistant."></textarea>
+    </label>
+    <div class="slider-grid">
+      <label>Max new tokens <output id="max-new-tokens-value">256</output>
+        <input id="max-new-tokens" type="range" min="16" max="512" step="16" value="256">
+      </label>
+      <label>Temperature <output id="temperature-value">0.7</output>
+        <input id="temperature" type="range" min="0" max="1.5" step="0.05" value="0.7">
+      </label>
+      <label>Top-p <output id="top-p-value">0.9</output>
+        <input id="top-p" type="range" min="0.1" max="1" step="0.05" value="0.9">
+      </label>
+      <label>Repetition penalty <output id="repetition-penalty-value">1.1</output>
+        <input id="repetition-penalty" type="range" min="1" max="1.5" step="0.05" value="1.1">
+      </label>
+    </div>
+  </section>
+
+  <main id="conversation" class="conversation" aria-live="polite">
+    <div id="empty-state" class="empty-state">
+      <p>Try one of these:</p>
+      <div class="examples">
+        <button class="example" type="button">Write a Python function that reverses a linked list.</button>
+        <button class="example" type="button">Write a SQL query to count orders per customer.</button>
+        <button class="example" type="button">Explain recursion to a beginner.</button>
+      </div>
+      <p class="note">Small model: good at short snippets, often wrong on anything that needs real reasoning.</p>
+    </div>
+  </main>
+
+  <form id="composer" class="composer">
+    <textarea id="message-input" rows="1" placeholder="Ask about code or anything else..." required></textarea>
+    <button id="send-button" type="submit">Send</button>
+    <button id="stop-button" type="button" class="ghost-button" hidden>Stop</button>
+    <button id="clear-button" type="button" class="ghost-button" title="Clear conversation">Clear</button>
+  </form>
+
+  <script src="/static/ChatClient.js"></script>
+</body>
+</html>

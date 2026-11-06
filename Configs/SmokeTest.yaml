@@ -1,0 +1,59 @@
+# Tiny model for smoke tests on CPU / Mac / a single Colab T4. Uses local data only.
+
+model:
+  vocab_size: 32768
+  dim: 128
+  n_layers: 2
+  n_heads: 4
+  n_kv_heads: 4
+  ffn_hidden_dim: 384
+  max_seq_len: 256
+  gradient_checkpointing: true
+
+data:
+  tokens_dir: data/tokens_debug
+  hub_repo: null
+  tokenizer_dir: data/tokens_debug/tokenizer
+
+train:
+  total_tokens: 400000
+  micro_batch_size: 4
+  tokens_per_step: 8192
+  max_lr: 1.0e-3
+  warmup_steps: 5
+  eval_interval: 20
+  eval_batches: 4
+  log_interval: 5
+  sample_interval: 40
+  checkpoint_interval: 20
+  checkpoint_dir: checkpoints_debug
+
+hub:
+  checkpoint_repo: null
+  push_checkpoints: false
+
+wandb:
+  enabled: false
+
+sft:
+  init_checkpoint: checkpoints_debug/pretrain/latest
+  output_dir: checkpoints_debug/sft
+  epochs: 1
+  micro_batch_size: 4
+  grad_accum_steps: 1
+  max_seq_len: 256
+  openhermes_samples: 0
+  max_examples: 400
+  eval_interval: 20
+  checkpoint_interval: 20
+
+dpo:
+  init_checkpoint: checkpoints_debug/sft/latest
+  output_dir: checkpoints_debug/dpo
+  max_pairs: 64
+  val_pairs: 8
+  micro_batch_size: 2
+  grad_accum_steps: 1
+  max_seq_len: 256
+  eval_interval: 10
+  checkpoint_interval: 10
