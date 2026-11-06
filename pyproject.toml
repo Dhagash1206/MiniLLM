@@ -21,7 +21,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "fastapi", "uvicorn"]
+dev = ["pytest"]
+# ONNX export for the in-browser demo (onnxruntime has no Python 3.15 wheels yet; use 3.11-3.14)
+web = ["onnx", "onnxruntime", "onnxscript"]
 
 [tool.setuptools.packages.find]
 include = ["MiniLLM*"]

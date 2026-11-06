@@ -4,13 +4,13 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>minillm chat</title>
-  <link rel="stylesheet" href="/static/ChatStyles.css">
+  <link rel="stylesheet" href="ChatStyles.css">
 </head>
 <body>
   <header class="top-bar">
     <div>
       <h1>minillm-125m</h1>
-      <p class="subtitle">A ~110M-parameter English + code model trained from scratch on free GPUs.</p>
+      <p class="subtitle">A ~110M-parameter English + code model trained from scratch on free GPUs. Runs entirely in your browser.</p>
     </div>
     <button id="settings-toggle" class="ghost-button" type="button" aria-expanded="false" aria-controls="settings-panel">Settings</button>
   </header>
@@ -35,6 +35,8 @@
     </div>
   </section>
 
+  <p id="load-status" class="load-status" role="status">Loading model...</p>
+
   <main id="conversation" class="conversation" aria-live="polite">
     <div id="empty-state" class="empty-state">
       <p>Try one of these:</p>
@@ -54,6 +56,6 @@
     <button id="clear-button" type="button" class="ghost-button" title="Clear conversation">Clear</button>
   </form>
 
-  <script src="/static/ChatClient.js"></script>
+  <script src="ChatClient.js"></script>
 </body>
 </html>

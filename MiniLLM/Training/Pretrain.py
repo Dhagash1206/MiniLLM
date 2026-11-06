@@ -23,6 +23,7 @@ from MiniLLM.Data.ShardLoader import PretrainSampler, ValidationSet, ensure_toke
 from MiniLLM.Model import Transformer, configure_optimizer
 from MiniLLM.Training.TrainingUtils import (
     CheckpointManager,
+    LossHealthGuard,
     Timer,
     WandbLogger,
     all_reduce_mean,
@@ -123,6 +124,7 @@ def main() -> None:
     checkpoints = CheckpointManager(
         f"{config.train.checkpoint_dir}/pretrain", config.hub.checkpoint_repo, config.hub.push_checkpoints,
         config.hub.private, config.hub.squash_history, path_in_repo="pretrain",
+        keep_last=config.train.keep_checkpoints, milestone_interval=config.train.milestone_interval,
     )
     start_step, tokens_seen, wandb_run_id = 0, 0, None
     if dist_info.is_main:
@@ -165,11 +167,22 @@ def main() -> None:
             flush=True,
         )
 
+    health = LossHealthGuard(config.train.loss_spike_threshold)
+    saved_steps: set[int] = set()
+
     def save_checkpoint(next_step: int, force: bool = False) -> None:
-        if dist_info.is_main:
+        # Loss is all-reduced every step, so every rank reaches the same decision here.
+        if next_step in saved_steps:
+            pass  # the interval save already covered the final step
+        elif not health.safe_to_save(next_step):
+            if dist_info.is_main:
+                print(f"[ckpt] loss unhealthy recently; NOT saving step {next_step} (keeping older checkpoints)",
+                      flush=True)
+        elif dist_info.is_main:
             state = {"step": next_step, "tokens_seen": tokens_seen, "wandb_run_id": logger.run_id if logger else None,
                      "total_steps": total_steps}
             if checkpoints.save(raw_model, optimizer, scaler if use_cuda else None, state, config, force=force):
+                saved_steps.add(next_step)
                 print(f"Saved checkpoint at step {next_step}", flush=True)
         if dist.is_initialized():
             dist.barrier()
@@ -210,9 +223,13 @@ def main() -> None:
             optimizer.zero_grad(set_to_none=True)
             tokens_seen += tokens_per_step
             completed_steps = step + 1
+            all_reduce_mean(loss_accum)
+            step_loss = loss_accum.item()
+            if not health.update(completed_steps, step_loss) and dist_info.is_main:
+                print(f"[health] step {completed_steps} loss {step_loss:.4f} vs average {health.loss_ema or 0:.4f}; "
+                      "checkpoint saving paused", flush=True)
 
             if completed_steps % config.train.log_interval == 0:
-                all_reduce_mean(loss_accum)
                 if use_cuda:
                     torch.cuda.synchronize()
                 elapsed = time.time() - window_start
@@ -225,10 +242,15 @@ def main() -> None:
                         "train/grad_norm": grad_norm.item(), "train/tokens_per_sec": tokens_per_second,
                         "train/tokens_seen": tokens_seen, "train/loss_scale": scaler.get_scale() if use_cuda else 1.0,
                     }
+                    memory_note = ""
+                    if use_cuda:
+                        # Peak since start: tells you whether micro_batch_size can go up (T4 has ~15 GB usable).
+                        metrics["train/peak_mem_gb"] = torch.cuda.max_memory_allocated(dist_info.device) / 1e9
+                        memory_note = f" mem {metrics['train/peak_mem_gb']:.1f}GB"
                     print(
                         f"step {completed_steps}/{total_steps} loss {metrics['train/loss']:.4f} "
                         f"lr {learning_rate:.2e} gnorm {metrics['train/grad_norm']:.2f} "
-                        f"{tokens_per_second / 1e3:.1f}k tok/s eta {remaining_hours:.1f}h",
+                        f"{tokens_per_second / 1e3:.1f}k tok/s{memory_note} eta {remaining_hours:.1f}h",
                         flush=True,
                     )
                     logger.log(metrics, completed_steps)

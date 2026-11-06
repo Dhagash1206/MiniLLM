@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import random
 from pathlib import Path
 
@@ -68,50 +70,68 @@ def _clean(messages: list[dict]) -> list[dict] | None:
     return cleaned
 
 
-def load_sft_conversations(openhermes_samples: int, seed: int) -> list[list[dict]]:
+def row_to_messages(row: dict) -> list[dict] | None:
+    """Map the common instruction-dataset layouts onto [{role, content}, ...]."""
+    if "messages" in row:  # smol-smoltalk, SmolTalk, most modern chat sets
+        return [{"role": turn["role"], "content": turn["content"]} for turn in row["messages"]]
+    if "conversations" in row:  # ShareGPT style (OpenHermes)
+        return [{"role": turn["from"], "content": turn["value"]} for turn in row["conversations"]]
+    if "problem" in row and "solution" in row:  # Magicoder-OSS-Instruct
+        return [{"role": "user", "content": row["problem"]}, {"role": "assistant", "content": row["solution"]}]
+    if "instruction" in row and "output" in row:  # Alpaca style
+        prompt = row["instruction"] + (f"\n\n{row['input']}" if row.get("input") else "")
+        return [{"role": "user", "content": prompt}, {"role": "assistant", "content": row["output"]}]
+    return None
+
+
+def collect_source_examples(
+    tokenizer: Tokenizer, source: dict, max_seq_len: int, seed: int, chunk_size: int = 2000
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Stream one dataset until `samples` examples fit in `max_seq_len` (0 = take everything)."""
     from datasets import load_dataset
 
-    conversations: list[list[dict]] = []
+    target = source.get("samples", 0)
+    # Streaming avoids downloading all of a large dataset when only a sample is needed.
+    stream = load_dataset(source["name"], split=source.get("split", "train"), streaming=True)
+    stream = stream.shuffle(seed=seed, buffer_size=10_000)
+    kept: list[tuple[np.ndarray, np.ndarray]] = []
+    pending: list[list[dict]] = []
 
-    code_alpaca = load_dataset("sahil2801/CodeAlpaca-20k", split="train")
-    for row in code_alpaca:
-        prompt = row["instruction"] + (f"\n\n{row['input']}" if row.get("input") else "")
-        conversations.append([{"role": "user", "content": prompt}, {"role": "assistant", "content": row["output"]}])
+    def flush() -> None:
+        for input_ids, labels in encode_conversations(tokenizer, pending):
+            # Drop (not truncate) long examples so no answer is cut mid-way.
+            if len(input_ids) <= max_seq_len and (labels >= 0).any():
+                kept.append((input_ids, labels))
+        pending.clear()
 
-    magicoder = load_dataset("ise-uiuc/Magicoder-OSS-Instruct-75K", split="train")
-    for row in magicoder:
-        conversations.append(
-            [{"role": "user", "content": row["problem"]}, {"role": "assistant", "content": row["solution"]}]
-        )
-
-    if openhermes_samples > 0:
-        openhermes = load_dataset("teknium/OpenHermes-2.5", split="train").shuffle(seed=seed)
-        openhermes = openhermes.select(range(min(openhermes_samples, len(openhermes))))
-        for row in openhermes:
-            conversations.append(
-                [{"role": turn["from"], "content": turn["value"]} for turn in row["conversations"]]
-            )
-
-    cleaned = [_clean(messages) for messages in conversations]
-    return [messages for messages in cleaned if messages is not None]
+    for row in stream:
+        messages = row_to_messages(row)
+        messages = _clean(messages) if messages else None
+        if messages is not None:
+            pending.append(messages)
+        if len(pending) >= chunk_size:
+            flush()
+            if target and len(kept) >= target:
+                break
+    flush()
+    if target and len(kept) < target:
+        print(f"Warning: {source['name']} yielded only {len(kept):,} of {target:,} requested examples")
+    return kept[:target] if target else kept
 
 
 def build_sft_dataset(
-    tokenizer_dir: str, max_seq_len: int, openhermes_samples: int, seed: int, max_examples: int = 0
+    tokenizer_dir: str, max_seq_len: int, sources: list[dict], seed: int
 ) -> list[tuple[np.ndarray, np.ndarray]]:
-    cache_path = Path(f"data/cache/sft_len{max_seq_len}_oh{openhermes_samples}_max{max_examples}_seed{seed}.pt")
+    mix_key = hashlib.sha1(json.dumps([sources, max_seq_len, seed], sort_keys=True).encode()).hexdigest()[:12]
+    cache_path = Path(f"data/cache/sft_{mix_key}.pt")
     if cache_path.exists():
         return torch.load(cache_path, weights_only=False)
     tokenizer = load_raw_tokenizer(tokenizer_dir)
-    conversations = load_sft_conversations(openhermes_samples, seed)
-    if max_examples:
-        random.Random(seed).shuffle(conversations)
-        conversations = conversations[:max_examples]
     examples = []
-    for start in range(0, len(conversations), 2000):
-        examples.extend(encode_conversations(tokenizer, conversations[start : start + 2000]))
-    # Drop (not truncate) long examples so no answer is cut mid-way.
-    examples = [example for example in examples if len(example[0]) <= max_seq_len and (example[1] >= 0).any()]
+    for source in sources:
+        source_examples = collect_source_examples(tokenizer, source, max_seq_len, seed)
+        print(f"SFT source {source['name']}: {len(source_examples):,} examples", flush=True)
+        examples.extend(source_examples)
     random.Random(seed).shuffle(examples)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(examples, cache_path)
