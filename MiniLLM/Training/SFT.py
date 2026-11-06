@@ -1,4 +1,4 @@
-"""Supervised fine-tuning on CodeAlpaca + Magicoder-OSS-Instruct + an OpenHermes subset.
+"""Supervised fine-tuning on the `sft.datasets` mix (default: smol-smoltalk + Magicoder-OSS-Instruct).
 
 Loss is computed only on assistant tokens. Set `sft.lora_enabled=true` for LoRA.
 
@@ -115,12 +115,10 @@ def main() -> None:
 
     if dist_info.is_main:
         ensure_tokenizer_available(config.data)
-        build_sft_dataset(config.data.tokenizer_dir, section.max_seq_len, section.openhermes_samples,
-                          config.data.seed, section.max_examples)
+        build_sft_dataset(config.data.tokenizer_dir, section.max_seq_len, section.datasets, config.data.seed)
     if dist.is_initialized():
         dist.barrier()
-    examples = build_sft_dataset(config.data.tokenizer_dir, section.max_seq_len, section.openhermes_samples,
-                                 config.data.seed, section.max_examples)
+    examples = build_sft_dataset(config.data.tokenizer_dir, section.max_seq_len, section.datasets, config.data.seed)
     tokenizer = load_tokenizer(config.data.tokenizer_dir)
     pad_id = tokenizer.convert_tokens_to_ids(PAD_TOKEN)
 
@@ -138,7 +136,8 @@ def main() -> None:
     scaler = torch.amp.GradScaler("cuda", enabled=use_cuda)
 
     checkpoints = CheckpointManager(section.output_dir, config.hub.checkpoint_repo, config.hub.push_checkpoints,
-                                    config.hub.private, config.hub.squash_history, path_in_repo="sft")
+                                    config.hub.private, config.hub.squash_history, path_in_repo="sft",
+                                    keep_last=config.train.keep_checkpoints)
     start_step, wandb_run_id = 0, None
     if dist_info.is_main:
         checkpoints.find_resume_dir()
@@ -183,12 +182,16 @@ def main() -> None:
         raw_model.train()
         return (loss_sum / token_count.clamp(min=1)).item()
 
+    saved_steps: set[int] = set()
+
     def save_checkpoint(next_step: int, force: bool = False) -> None:
-        if dist_info.is_main:
+        # Skips a duplicate save when the interval save already covered the final step.
+        if dist_info.is_main and next_step not in saved_steps:
             model_state, extra_files = checkpoint_payload(raw_model, section)
             state = {"step": next_step, "total_steps": total_steps, "wandb_run_id": logger.run_id if logger else None}
             if checkpoints.save(raw_model, optimizer, scaler if use_cuda else None, state, config, force=force,
                                 extra_files=extra_files, model_state=model_state):
+                saved_steps.add(next_step)
                 print(f"Saved SFT checkpoint at step {next_step}", flush=True)
         if dist.is_initialized():
             dist.barrier()

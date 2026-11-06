@@ -102,7 +102,8 @@ def from_hf(model_dir_or_repo: str) -> Transformer:
 
 def load_any_model(path: str, device: str | torch.device = "cpu") -> Transformer:
     """Accepts a minillm checkpoint dir, `hub:<repo>:<subdir>`, or an HF Llama folder / repo id."""
-    candidate = resolve_checkpoint(path) if path.startswith("hub:") else Path(path)
+    # `.../latest` (local or hub:) resolves to the newest step-XXXXX checkpoint folder.
+    candidate = resolve_checkpoint(path) if path.startswith("hub:") or Path(path).name == "latest" else Path(path)
     if (candidate / "model.pt").exists():
         model, _ = load_model_weights(candidate, device)
     else:

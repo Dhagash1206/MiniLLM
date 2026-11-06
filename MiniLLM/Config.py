@@ -23,7 +23,8 @@ class ModelConfig:
     rope_theta: float = 10000.0
     norm_eps: float = 1e-5
     tie_embeddings: bool = True
-    gradient_checkpointing: bool = True
+    # Off by default: recomputing activations costs ~33% more compute; 125M fits a T4 without it.
+    gradient_checkpointing: bool = False
 
     @property
     def head_dim(self) -> int:
@@ -42,7 +43,7 @@ class DataConfig:
 @dataclass
 class TrainConfig:
     total_tokens: int = 2_500_000_000
-    micro_batch_size: int = 16
+    micro_batch_size: int = 8
     tokens_per_step: int = 524_288
     max_lr: float = 6e-4
     min_lr_ratio: float = 0.1
@@ -59,6 +60,10 @@ class TrainConfig:
     # Stop cleanly before Kaggle's 12h session limit so the last checkpoint is uploaded.
     max_runtime_hours: float = 11.25
     checkpoint_dir: str = "checkpoints"
+    keep_checkpoints: int = 2  # newest full step-XXXXX checkpoints kept locally and on the Hub
+    milestone_interval: int = 1000  # fp16 weights-only snapshots kept forever (model versions)
+    # A step whose loss exceeds its running average by this much blocks checkpoint saves for a while.
+    loss_spike_threshold: float = 0.5
     compile: bool = False
 
 
@@ -91,8 +96,11 @@ class SFTConfig:
     weight_decay: float = 0.0
     grad_clip: float = 1.0
     max_seq_len: int = 1024
-    openhermes_samples: int = 60_000
-    max_examples: int = 0  # 0 = use everything; small values for smoke tests
+    # Each entry: Hub dataset, split, and how many examples to keep after the length filter (0 = all).
+    datasets: list[dict] = field(default_factory=lambda: [
+        {"name": "HuggingFaceTB/smol-smoltalk", "split": "train", "samples": 200_000},
+        {"name": "ise-uiuc/Magicoder-OSS-Instruct-75K", "split": "train", "samples": 0},
+    ])
     val_fraction: float = 0.01
     eval_interval: int = 200
     log_interval: int = 10
@@ -145,6 +153,8 @@ class RunConfig:
 
 
 def _coerce(raw_value: str, current: Any) -> Any:
+    if isinstance(current, list):
+        raise ValueError("List settings (e.g. sft.datasets) can only be set in the YAML file")
     if isinstance(current, bool):
         return raw_value.lower() in {"1", "true", "yes", "on"}
     if isinstance(current, int):

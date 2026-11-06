@@ -1,7 +1,13 @@
 "use strict";
 
+// Static Spaces expose Space variables here; `?model=user/repo` overrides for local testing.
+const MODEL_REPO = new URLSearchParams(location.search).get("model")
+  || window.huggingface?.variables?.MODEL_REPO
+  || "your-username/minillm-125m-chat";
+
 const conversationElement = document.getElementById("conversation");
 const emptyState = document.getElementById("empty-state");
+const loadStatus = document.getElementById("load-status");
 const composer = document.getElementById("composer");
 const messageInput = document.getElementById("message-input");
 const sendButton = document.getElementById("send-button");
@@ -12,7 +18,11 @@ const settingsPanel = document.getElementById("settings-panel");
 
 const sliderIds = ["max-new-tokens", "temperature", "top-p", "repetition-penalty"];
 const history = [];
-let activeController = null;
+const fileProgress = new Map();
+let modelReady = false;
+let activeReply = null;  // { bubble, text } while a reply is streaming
+
+const worker = new Worker("ModelWorker.js", { type: "module" });
 
 function escapeHtml(text) {
   return text.replace(/[&<>"']/g, (character) => ({
@@ -60,96 +70,82 @@ function readSettings() {
 }
 
 function setBusy(isBusy) {
-  sendButton.disabled = isBusy;
-  messageInput.disabled = isBusy;
+  sendButton.disabled = isBusy || !modelReady;
+  messageInput.disabled = isBusy || !modelReady;
   stopButton.hidden = !isBusy;
   clearButton.disabled = isBusy;
-  if (!isBusy) messageInput.focus();
+  if (!isBusy && modelReady) messageInput.focus();
 }
 
-// Parses a chunk of server-sent events; returns [events, leftover partial text].
-function parseEvents(buffer) {
-  const events = [];
-  const blocks = buffer.split("\n\n");
-  const leftover = blocks.pop();
-  for (const block of blocks) {
-    let eventName = "message";
-    let data = "";
-    for (const line of block.split("\n")) {
-      if (line.startsWith("event: ")) eventName = line.slice(7);
-      else if (line.startsWith("data: ")) data += line.slice(6);
-    }
-    events.push({ eventName, payload: data ? JSON.parse(data) : {} });
+function showLoadProgress(data) {
+  if (data.status === "progress" && data.total) {
+    fileProgress.set(data.file, { loaded: data.loaded, total: data.total });
+    let loaded = 0;
+    let total = 0;
+    for (const entry of fileProgress.values()) { loaded += entry.loaded; total += entry.total; }
+    loadStatus.textContent = `Downloading model: ${(loaded / 1e6).toFixed(0)} / ${(total / 1e6).toFixed(0)} MB`;
   }
-  return [events, leftover];
 }
 
-async function sendMessage(text) {
+function finishReply() {
+  if (!activeReply) return;
+  const { bubble, text } = activeReply;
+  bubble.classList.remove("typing");
+  if (text) {
+    history.push({ role: "assistant", content: text });
+  } else {
+    bubble.innerHTML = '<span class="status">(no reply)</span>';
+    history.pop();  // Drop the unanswered user turn so roles keep alternating.
+  }
+  activeReply = null;
+  setBusy(false);
+}
+
+worker.addEventListener("message", (event) => {
+  const message = event.data;
+  if (message.type === "progress") {
+    showLoadProgress(message.data);
+  } else if (message.type === "ready") {
+    modelReady = true;
+    loadStatus.textContent = `Model loaded (${MODEL_REPO}). Replies are generated on your device.`;
+    setBusy(false);
+  } else if (message.type === "token" && activeReply) {
+    activeReply.text += message.text;
+    activeReply.bubble.innerHTML = renderReply(activeReply.text);
+    activeReply.bubble.scrollIntoView({ block: "end" });
+  } else if (message.type === "done") {
+    finishReply();
+  } else if (message.type === "error") {
+    if (activeReply) {
+      activeReply.bubble.parentElement.classList.add("error");
+      activeReply.bubble.textContent = `Error: ${message.message}`;
+      activeReply.text = "";
+      history.pop();
+      activeReply.bubble.classList.remove("typing");
+      activeReply = null;
+      setBusy(false);
+    } else {
+      loadStatus.textContent = `Could not load ${MODEL_REPO}: ${message.message}`;
+      loadStatus.classList.add("error");
+    }
+  }
+});
+
+function sendMessage(text) {
+  if (!modelReady || activeReply) return;
   history.push({ role: "user", content: text });
   addMessage("user", text);
   const bubble = addMessage("assistant", "");
   bubble.classList.add("typing");
+  activeReply = { bubble, text: "" };
   setBusy(true);
-
-  activeController = new AbortController();
-  let reply = "";
-  try {
-    const response = await fetch("/api/chat", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ messages: history, ...readSettings() }),
-      signal: activeController.signal,
-    });
-    if (!response.ok) {
-      const detail = await response.json().catch(() => ({}));
-      throw new Error(typeof detail.detail === "string" ? detail.detail : `Request failed (${response.status})`);
-    }
-
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const [events, leftover] = parseEvents(buffer);
-      buffer = leftover;
-      for (const { eventName, payload } of events) {
-        if (eventName === "start" && payload.queued) {
-          bubble.innerHTML = '<span class="status">Waiting for another reply to finish...</span>';
-        } else if (eventName === "token") {
-          reply += payload.text;
-          bubble.innerHTML = renderReply(reply);
-          bubble.scrollIntoView({ block: "end" });
-        } else if (eventName === "error") {
-          throw new Error(payload.message);
-        }
-      }
-    }
-  } catch (error) {
-    if (error.name !== "AbortError") {
-      bubble.parentElement.classList.add("error");
-      bubble.textContent = `Error: ${error.message}`;
-    }
-  } finally {
-    bubble.classList.remove("typing");
-    if (reply) {
-      history.push({ role: "assistant", content: reply });
-    } else if (!bubble.parentElement.classList.contains("error")) {
-      bubble.innerHTML = '<span class="status">(no reply)</span>';
-      history.pop();  // Drop the unanswered user turn so roles keep alternating.
-    } else {
-      history.pop();
-    }
-    activeController = null;
-    setBusy(false);
-  }
+  worker.postMessage({ type: "generate", messages: history.slice(), settings: readSettings() });
 }
 
 composer.addEventListener("submit", (event) => {
   event.preventDefault();
   const text = messageInput.value.trim();
-  if (!text || activeController) return;
+  if (!text) return;
   messageInput.value = "";
   messageInput.style.height = "auto";
   sendMessage(text);
@@ -167,7 +163,7 @@ messageInput.addEventListener("input", () => {
   messageInput.style.height = `${messageInput.scrollHeight}px`;
 });
 
-stopButton.addEventListener("click", () => activeController?.abort());
+stopButton.addEventListener("click", () => worker.postMessage({ type: "stop" }));
 
 clearButton.addEventListener("click", () => {
   history.length = 0;
@@ -187,9 +183,8 @@ for (const sliderId of sliderIds) {
 }
 
 document.querySelectorAll(".example").forEach((button) => {
-  button.addEventListener("click", () => {
-    if (!activeController) sendMessage(button.textContent);
-  });
+  button.addEventListener("click", () => sendMessage(button.textContent));
 });
 
-messageInput.focus();
+setBusy(false);
+worker.postMessage({ type: "load", modelRepo: MODEL_REPO });

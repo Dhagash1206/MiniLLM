@@ -95,7 +95,8 @@ def main() -> None:
     optimizer = configure_optimizer(policy, 0.0, section.max_lr, (0.9, 0.95), dist_info.device.type)
     scaler = torch.amp.GradScaler("cuda", enabled=use_cuda)
     checkpoints = CheckpointManager(section.output_dir, config.hub.checkpoint_repo, config.hub.push_checkpoints,
-                                    config.hub.private, config.hub.squash_history, path_in_repo="dpo")
+                                    config.hub.private, config.hub.squash_history, path_in_repo="dpo",
+                                    keep_last=config.train.keep_checkpoints)
     start_step, wandb_run_id = 0, None
     if dist_info.is_main:
         checkpoints.find_resume_dir()
@@ -149,12 +150,16 @@ def main() -> None:
         totals = totals / batch_count.clamp(min=1)
         return {"dpo/val_loss": totals[0].item(), "dpo/val_reward_accuracy": totals[1].item()}
 
+    saved_steps: set[int] = set()
+
     def save_checkpoint(next_step: int, force: bool = False) -> None:
-        if dist_info.is_main:
+        # Skips a duplicate save when the interval save already covered the final step.
+        if dist_info.is_main and next_step not in saved_steps:
             model_state, extra_files = checkpoint_payload(raw_policy, section)
             state = {"step": next_step, "total_steps": total_steps, "wandb_run_id": logger.run_id if logger else None}
-            checkpoints.save(raw_policy, optimizer, scaler if use_cuda else None, state, config, force=force,
-                             extra_files=extra_files, model_state=model_state)
+            if checkpoints.save(raw_policy, optimizer, scaler if use_cuda else None, state, config, force=force,
+                                extra_files=extra_files, model_state=model_state):
+                saved_steps.add(next_step)
         if dist.is_initialized():
             dist.barrier()
 

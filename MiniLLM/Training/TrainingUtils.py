@@ -93,66 +93,157 @@ def unwrap(model: torch.nn.Module) -> Transformer:
     return getattr(model, "_orig_mod", model)
 
 
+STEP_PREFIX = "step-"
+
+
+def step_dir_name(step: int) -> str:
+    return f"{STEP_PREFIX}{step:05d}"
+
+
+def step_number(name: str) -> int:
+    return int(name.rsplit(STEP_PREFIX, 1)[1].split("-")[0])
+
+
+def newest_step_dir(directory: Path) -> Path | None:
+    candidates = [path for path in directory.glob(f"{STEP_PREFIX}*")
+                  if path.is_dir() and not path.name.endswith(".tmp") and (path / "model.pt").exists()]
+    return max(candidates, key=lambda path: step_number(path.name), default=None)
+
+
+def hub_step_folders(api, repo_id: str, prefix: str) -> list[str]:
+    """Full-checkpoint folders like `pretrain/step-00250` on the Hub, oldest first (milestones excluded)."""
+    folders = set()
+    for file_path in api.list_repo_files(repo_id):
+        parts = file_path.split("/")
+        if len(parts) >= 3 and parts[0] == prefix and parts[1].startswith(STEP_PREFIX):
+            folders.add(f"{parts[0]}/{parts[1]}")
+    return sorted(folders, key=step_number)
+
+
+class LossHealthGuard:
+    """Flags NaN losses and sudden spikes so a diverging model never overwrites good checkpoints."""
+
+    def __init__(self, spike_threshold: float, ema_decay: float = 0.99, cooldown_steps: int = 50):
+        self.spike_threshold = spike_threshold
+        self.ema_decay = ema_decay
+        self.cooldown_steps = cooldown_steps
+        self.loss_ema: float | None = None
+        self.unhealthy_until_step = -1
+
+    def update(self, step: int, loss: float) -> bool:
+        """Record one optimizer step's loss; returns False when this step looks unhealthy."""
+        if not math.isfinite(loss):
+            self.unhealthy_until_step = step + self.cooldown_steps
+            return False
+        healthy = self.loss_ema is None or loss <= self.loss_ema + self.spike_threshold
+        if not healthy:
+            self.unhealthy_until_step = step + self.cooldown_steps
+        self.loss_ema = loss if self.loss_ema is None else (
+            self.ema_decay * self.loss_ema + (1 - self.ema_decay) * loss)
+        return healthy
+
+    def safe_to_save(self, step: int) -> bool:
+        return step > self.unhealthy_until_step
+
+
 class CheckpointManager:
-    """Saves `<dir>/latest` atomically and mirrors it to a HF model repo in a background thread."""
+    """Saves `<dir>/step-XXXXX/` atomically, keeps the newest `keep_last`, writes fp16 milestones,
+    and mirrors everything to a HF model repo in a background thread."""
 
     def __init__(self, local_dir: str | Path, hub_repo: str | None, push: bool, private: bool, squash: bool,
-                 path_in_repo: str):
+                 path_in_repo: str, keep_last: int = 2, milestone_interval: int | None = None):
         self.local_dir = Path(local_dir)
         self.hub_repo = hub_repo if push else None
         self.private = private
         self.squash = squash
         self.path_in_repo = path_in_repo
+        self.keep_last = max(1, keep_last)
+        self.milestone_interval = milestone_interval
         self.executor = ThreadPoolExecutor(max_workers=1)
         self.pending_upload: Future | None = None
 
-    @property
-    def latest_dir(self) -> Path:
-        return self.local_dir / "latest"
-
     def save(self, model, optimizer, scaler, state: dict, config: RunConfig, force: bool = False,
              extra_files: dict[str, object] | None = None, model_state: dict | None = None) -> bool:
-        """Returns False when skipped because the previous upload is still reading `latest`."""
+        """Returns False when skipped because the previous upload is still running."""
         self.local_dir.mkdir(parents=True, exist_ok=True)
         if self.pending_upload is not None and not self.pending_upload.done() and not force:
             # Waiting here could exceed the NCCL barrier timeout on slow uploads; just skip this one.
             print("[ckpt] previous upload still running; skipping this checkpoint", flush=True)
             return False
         self.wait_for_upload()
-        staging_dir = self.local_dir / "latest.tmp"
+
+        step = state.get("step", 0)
+        name = step_dir_name(step)
+        model_state = model_state if model_state is not None else model.state_dict()
+        staging_dir = self.local_dir / f"{name}.tmp"
         shutil.rmtree(staging_dir, ignore_errors=True)
         staging_dir.mkdir(parents=True)
-        torch.save(model_state if model_state is not None else model.state_dict(), staging_dir / "model.pt")
+        torch.save(model_state, staging_dir / "model.pt")
         for file_name, payload in (extra_files or {}).items():
             torch.save(payload, staging_dir / file_name)
         training_state = {"optimizer": optimizer.state_dict(), "scaler": scaler.state_dict() if scaler else None}
         torch.save(training_state, staging_dir / "training_state.pt")
         (staging_dir / "state.json").write_text(json.dumps(state, indent=2))
         (staging_dir / "config.json").write_text(json.dumps(config.to_dict(), indent=2))
-        shutil.rmtree(self.latest_dir, ignore_errors=True)
-        staging_dir.rename(self.latest_dir)
+        final_dir = self.local_dir / name
+        shutil.rmtree(final_dir, ignore_errors=True)
+        staging_dir.rename(final_dir)
+
+        milestone_dir = None
+        is_final = step == state.get("total_steps")
+        if self.milestone_interval and (step % self.milestone_interval == 0 or is_final):
+            milestone_dir = self._save_milestone(name, model_state, state, config)
+        self._prune_local()
 
         if self.hub_repo:
-            self.pending_upload = self.executor.submit(self._upload, state.get("step", 0))
+            self.pending_upload = self.executor.submit(self._upload, name, milestone_dir)
         return True
 
-    def _upload(self, step: int) -> None:
+    def _save_milestone(self, name: str, model_state: dict, state: dict, config: RunConfig) -> Path:
+        # Weights only, in fp16: half the size, enough to evaluate or fine-tune from (not to resume exactly).
+        milestone_dir = self.local_dir / "milestones" / f"{name}-fp16"
+        milestone_dir.mkdir(parents=True, exist_ok=True)
+        half_state = {key: tensor.half() if tensor.is_floating_point() else tensor
+                      for key, tensor in model_state.items()}
+        torch.save(half_state, milestone_dir / "model.pt")
+        (milestone_dir / "state.json").write_text(json.dumps(state, indent=2))
+        (milestone_dir / "config.json").write_text(json.dumps(config.to_dict(), indent=2))
+        return milestone_dir
+
+    def _prune_local(self) -> None:
+        local_steps = sorted((path for path in self.local_dir.glob(f"{STEP_PREFIX}*")
+                              if path.is_dir() and not path.name.endswith(".tmp")),
+                             key=lambda path: step_number(path.name))
+        for old_dir in local_steps[: -self.keep_last]:
+            shutil.rmtree(old_dir, ignore_errors=True)
+
+    def _upload(self, name: str, milestone_dir: Path | None) -> None:
         from huggingface_hub import HfApi
 
         api = HfApi()
         try:
             api.create_repo(self.hub_repo, repo_type="model", private=self.private, exist_ok=True)
             api.upload_folder(
-                folder_path=str(self.latest_dir),
+                folder_path=str(self.local_dir / name),
                 repo_id=self.hub_repo,
-                path_in_repo=f"{self.path_in_repo}/latest",
-                commit_message=f"{self.path_in_repo} checkpoint step {step}",
+                path_in_repo=f"{self.path_in_repo}/{name}",
+                commit_message=f"{self.path_in_repo} checkpoint {name}",
             )
+            if milestone_dir is not None:
+                api.upload_folder(
+                    folder_path=str(milestone_dir),
+                    repo_id=self.hub_repo,
+                    path_in_repo=f"{self.path_in_repo}/milestones/{milestone_dir.name}",
+                    commit_message=f"{self.path_in_repo} milestone {milestone_dir.name}",
+                )
+            for old_folder in hub_step_folders(api, self.hub_repo, self.path_in_repo)[: -self.keep_last]:
+                api.delete_folder(old_folder, repo_id=self.hub_repo, commit_message=f"Prune {old_folder}")
             if self.squash:
+                # Deleted folders only free storage once they are gone from history too.
                 api.super_squash_history(repo_id=self.hub_repo, repo_type="model")
-            print(f"[hub] uploaded {self.path_in_repo} step {step} to {self.hub_repo}", flush=True)
+            print(f"[hub] uploaded {self.path_in_repo}/{name} to {self.hub_repo}", flush=True)
         except Exception as error:  # A failed upload must not kill a long training run.
-            print(f"[hub] upload failed at step {step}: {error}", flush=True)
+            print(f"[hub] upload failed for {name}: {error}", flush=True)
 
     def wait_for_upload(self) -> None:
         if self.pending_upload is not None:
@@ -160,22 +251,23 @@ class CheckpointManager:
             self.pending_upload = None
 
     def find_resume_dir(self) -> Path | None:
-        if (self.latest_dir / "state.json").exists():
-            return self.latest_dir
+        local_newest = newest_step_dir(self.local_dir)
+        if local_newest is not None and (local_newest / "state.json").exists():
+            return local_newest
         if not self.hub_repo:
             return None
-        from huggingface_hub import snapshot_download
+        from huggingface_hub import HfApi, snapshot_download
         from huggingface_hub.errors import RepositoryNotFoundError
 
         try:
-            download_root = snapshot_download(
-                repo_id=self.hub_repo,
-                allow_patterns=[f"{self.path_in_repo}/latest/*"],
-                local_dir=str(self.local_dir / "hub_download"),
-            )
+            folders = hub_step_folders(HfApi(), self.hub_repo, self.path_in_repo)
         except RepositoryNotFoundError:
             return None
-        candidate = Path(download_root) / self.path_in_repo / "latest"
+        if not folders:
+            return None
+        download_root = snapshot_download(repo_id=self.hub_repo, allow_patterns=[f"{folders[-1]}/*"],
+                                          local_dir=str(self.local_dir / "hub_download"))
+        candidate = Path(download_root) / folders[-1]
         return candidate if (candidate / "state.json").exists() else None
 
 
@@ -185,19 +277,35 @@ def load_model_weights(checkpoint_dir: str | Path, device: torch.device | str = 
     model_config = ModelConfig(**saved_config["model"])
     model = Transformer(model_config)
     state_dict = torch.load(checkpoint_dir / "model.pt", map_location="cpu", weights_only=True)
+    # fp16 milestones load into the fp32 model; load_state_dict copies with a dtype cast.
     model.load_state_dict(state_dict)
     return model.to(device), saved_config
 
 
 def resolve_checkpoint(path_or_repo: str, path_in_repo: str = "pretrain/latest") -> Path:
-    """Accepts a local checkpoint dir or `hub:<repo_id>[:<path_in_repo>]`."""
+    """Accepts a local checkpoint dir or `hub:<repo_id>[:<path_in_repo>]`.
+
+    A final path component of `latest` means "the newest step-XXXXX folder" there.
+    """
     if not path_or_repo.startswith("hub:"):
-        return Path(path_or_repo)
-    from huggingface_hub import snapshot_download
+        path = Path(path_or_repo)
+        if path.name == "latest" and not path.exists():
+            newest = newest_step_dir(path.parent)
+            if newest is None:
+                raise FileNotFoundError(f"No step-XXXXX checkpoints in {path.parent}")
+            return newest
+        return path
+    from huggingface_hub import HfApi, snapshot_download
 
     parts = path_or_repo[len("hub:") :].split(":", 1)
     repo_id = parts[0]
     subdir = parts[1] if len(parts) > 1 else path_in_repo
+    if subdir.split("/")[-1] == "latest":
+        prefix = subdir.rsplit("/", 1)[0]
+        folders = hub_step_folders(HfApi(), repo_id, prefix)
+        if not folders:
+            raise FileNotFoundError(f"No {prefix}/step-XXXXX checkpoints in {repo_id}")
+        subdir = folders[-1]
     root = snapshot_download(repo_id=repo_id, allow_patterns=[f"{subdir}/*"], local_dir=f"checkpoints/hub/{repo_id}")
     return Path(root) / subdir
 

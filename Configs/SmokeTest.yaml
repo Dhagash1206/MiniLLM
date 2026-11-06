@@ -27,6 +27,8 @@ train:
   sample_interval: 40
   checkpoint_interval: 20
   checkpoint_dir: checkpoints_debug
+  keep_checkpoints: 2
+  milestone_interval: 40
 
 hub:
   checkpoint_repo: null
@@ -42,8 +44,9 @@ sft:
   micro_batch_size: 4
   grad_accum_steps: 1
   max_seq_len: 256
-  openhermes_samples: 0
-  max_examples: 400
+  datasets:
+    - {name: HuggingFaceTB/smol-smoltalk, split: test, samples: 60}
+    - {name: ise-uiuc/Magicoder-OSS-Instruct-75K, split: train, samples: 40}
   eval_interval: 20
   checkpoint_interval: 20
 
