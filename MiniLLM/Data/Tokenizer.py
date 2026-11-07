@@ -2,6 +2,8 @@
 
 Usage:
     python -m MiniLLM.Data.Tokenizer --out artifacts/tokenizer --docs-per-source 150000
+    # On a rerun, reuse the tokenizer already shipped with the shards so new shards stay compatible:
+    python -m MiniLLM.Data.Tokenizer --out artifacts/tokenizer --reuse-from-hub $HF_USERNAME/minillm-tokens
 """
 
 from __future__ import annotations
@@ -9,6 +11,7 @@ from __future__ import annotations
 import argparse
 import itertools
 import random
+import shutil
 from pathlib import Path
 
 from tokenizers import Regex, Tokenizer, decoders, models, pre_tokenizers, trainers
@@ -63,7 +66,8 @@ def train_tokenizer(text_iterator, vocab_size: int = 32768, total_docs: int | No
         min_frequency=2,
         special_tokens=SPECIAL_TOKENS,
         initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
-        show_progress=True,
+        # The progress bar alone filled Kaggle's log size limit and hid every later line.
+        show_progress=False,
     )
     tokenizer.train_from_iterator(text_iterator, trainer=trainer, length=total_docs)
 
@@ -116,12 +120,33 @@ def mixed_sample_iterator(docs_per_source: int, seed: int):
 
     rng = random.Random(seed)
     active_streams = list(streams)
+    yielded_docs = 0
     while active_streams:
         stream = rng.choice(active_streams)
         try:
             yield next(stream)
         except StopIteration:
             active_streams.remove(stream)
+            continue
+        yielded_docs += 1
+        if yielded_docs % 25_000 == 0:
+            print(f"Tokenizer sample: {yielded_docs:,} docs", flush=True)
+
+
+def download_hub_tokenizer(dataset_repo: str, out_dir: str | Path) -> bool:
+    from huggingface_hub import HfApi, snapshot_download
+    from huggingface_hub.errors import RepositoryNotFoundError
+
+    try:
+        hub_files = HfApi().list_repo_files(dataset_repo, repo_type="dataset")
+    except RepositoryNotFoundError:
+        return False
+    if "tokenizer/tokenizer.json" not in hub_files:
+        return False
+    local_dir = Path(out_dir).parent / "_hub_tokenizer"
+    snapshot_download(dataset_repo, repo_type="dataset", allow_patterns=["tokenizer/*"], local_dir=local_dir)
+    shutil.copytree(local_dir / "tokenizer", out_dir, dirs_exist_ok=True)
+    return True
 
 
 def main() -> None:
@@ -131,7 +156,13 @@ def main() -> None:
     parser.add_argument("--docs-per-source", type=int, default=150_000, help="Docs for the largest source")
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--push-to-hub", default=None, help="Optional HF repo id to upload the tokenizer to")
+    parser.add_argument("--reuse-from-hub", default=None,
+                        help="HF dataset repo; if it already has tokenizer/, download that instead of training")
     args = parser.parse_args()
+
+    if args.reuse_from_hub and download_hub_tokenizer(args.reuse_from_hub, args.out):
+        print(f"Reused tokenizer from datasets/{args.reuse_from_hub}/tokenizer -> {args.out}")
+        return
 
     tokenizer = train_tokenizer(mixed_sample_iterator(args.docs_per_source, args.seed), args.vocab_size)
     save_tokenizer(tokenizer, args.out)
