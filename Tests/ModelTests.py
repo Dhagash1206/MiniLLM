@@ -41,7 +41,7 @@ def test_kv_cache_matches_full_forward():
     tokens = torch.randint(0, TINY.vocab_size, (2, 10))
     full_logits, _ = model(tokens)
 
-    cache = KVCache(TINY.n_layers)
+    cache = KVCache(TINY.n_layers, max_length=10)
     prefix_logits, _ = model(tokens[:, :4], kv_cache=cache)
     chunk_logits, _ = model(tokens[:, 4:7], kv_cache=cache)  # chunked prefill path (explicit mask)
     step_logits = [model(tokens[:, index : index + 1], kv_cache=cache)[0] for index in range(7, 10)]
@@ -56,6 +56,60 @@ def test_greedy_generate_same_with_and_without_cache():
     without_cache = model.generate(prompt, max_new_tokens=40, temperature=0, use_cache=False)
     # 45 tokens > max_seq_len=32 also exercises the cache-rebuild path.
     assert torch.equal(with_cache, without_cache)
+
+
+def test_left_padded_batch_matches_single_prompts():
+    model = make_model()
+    prompts = [torch.randint(1, TINY.vocab_size, (length,)) for length in (3, 7, 5)]
+    width = max(len(prompt) for prompt in prompts)
+    padded = torch.zeros((len(prompts), width), dtype=torch.long)
+    mask = torch.zeros((len(prompts), width), dtype=torch.long)
+    for row, prompt in enumerate(prompts):
+        padded[row, width - len(prompt) :] = prompt
+        mask[row, width - len(prompt) :] = 1
+
+    batched = model.generate(padded, max_new_tokens=12, temperature=0, attention_mask=mask)
+    for row, prompt in enumerate(prompts):
+        single = model.generate(prompt[None], max_new_tokens=12, temperature=0)
+        assert torch.equal(batched[row, width:], single[0, len(prompt) :])
+    # Padded forward logits at real positions match the unpadded forward.
+    padded_logits, _ = model(padded, attention_mask=mask)
+    plain_logits, _ = model(prompts[0][None])
+    assert torch.allclose(padded_logits[0, width - 3 :], plain_logits[0], atol=1e-5)
+
+
+class CharTokenizer:
+    """Token id i decodes to chr(ord('a') + i % 26): enough to test stop strings without a real vocab."""
+
+    def decode(self, token_ids: list[int]) -> str:
+        return "".join(chr(ord("a") + token_id % 26) for token_id in token_ids)
+
+
+def test_stop_strings_and_eos_end_rows_independently():
+    model = make_model()
+    prompt = torch.randint(0, TINY.vocab_size, (2, 4))
+    free_run = model.generate(prompt, max_new_tokens=10, temperature=0)[:, 4:]
+    tokenizer = CharTokenizer()
+    # Stop row 0 on the text of its own 3rd-4th tokens; stop row 1 on its 2nd token as EOS.
+    stop_text = tokenizer.decode(free_run[0, 2:4].tolist())
+    eos_id = int(free_run[1, 1])
+    output = model.generate(prompt, max_new_tokens=10, temperature=0, stop_strings=[stop_text],
+                            tokenizer=tokenizer, eos_token_ids=[eos_id], pad_token_id=0)[:, 4:]
+    row0_end = next(i for i in range(10) if stop_text in tokenizer.decode(free_run[0, : i + 1].tolist())) + 1
+    row1_end = next(i for i in range(10) if int(free_run[1, i]) == eos_id) + 1
+    assert row0_end <= 4 and row1_end <= 2
+    assert torch.equal(output[0, :row0_end], free_run[0, :row0_end])
+    assert torch.equal(output[1, :row1_end], free_run[1, :row1_end])
+    # Both rows stopped, so generation ended early; finished rows were filled with the pad id.
+    assert output.shape[1] == max(row0_end, row1_end)
+    assert (output[1, row1_end:] == 0).all()
+
+
+def test_stream_generate_yields_the_same_tokens():
+    model = make_model()
+    prompt = torch.randint(0, TINY.vocab_size, (1, 5))
+    streamed = torch.cat(list(model.stream_generate(prompt, max_new_tokens=8, temperature=0)), dim=1)
+    assert torch.equal(streamed, model.generate(prompt, max_new_tokens=8, temperature=0)[:, 5:])
 
 
 def test_top_p_keeps_only_nucleus():

@@ -21,6 +21,7 @@ from pathlib import Path
 import numpy as np
 from tokenizers import Tokenizer
 
+from MiniLLM.Data.DocumentFilters import Deduplicator
 from MiniLLM.Data.PretrainSources import DEFAULT_DOWNLOAD_DIR, PRETRAIN_SOURCES, SOURCES_BY_NAME, FilterStats, iter_documents
 from MiniLLM.Data.Tokenizer import EOS_TOKEN
 
@@ -67,6 +68,7 @@ def prepare_source(
     batch_docs: int,
     seed: int,
     download_dir: str,
+    near_dedup: bool = False,
 ) -> dict:
     spec = SOURCES_BY_NAME[source_name]
     eos_id = tokenizer.token_to_id(EOS_TOKEN)
@@ -84,7 +86,8 @@ def prepare_source(
             writer.add(token_ids)
 
     pending_texts: list[str] = []
-    for text in iter_documents(spec, stats=stats, seed=seed, download_dir=download_dir):
+    deduplicator = Deduplicator(near_duplicates=near_dedup)
+    for text in iter_documents(spec, deduplicator=deduplicator, stats=stats, seed=seed, download_dir=download_dir):
         pending_texts.append(text)
         if len(pending_texts) >= batch_docs:
             write_batch(pending_texts)
@@ -148,6 +151,8 @@ def main() -> None:
     parser.add_argument("--batch-docs", type=int, default=1000)
     parser.add_argument("--sources", nargs="+", default=[spec.name for spec in PRETRAIN_SOURCES])
     parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument("--near-dedup", action="store_true",
+                        help="Also drop near-duplicates (MinHash LSH, Jaccard ~0.7); ~1.5 GB RAM per million docs")
     parser.add_argument("--push-to-hub", default=None, help="HF dataset repo id for the shards")
     args = parser.parse_args()
 
@@ -188,7 +193,7 @@ def main() -> None:
         print(f"Preparing {source_name}: {train_tokens:,} train / {val_tokens:,} val tokens", flush=True)
         meta = prepare_source(
             source_name, tokenizer, out_dir, train_tokens, val_tokens,
-            int(args.shard_tokens), args.batch_docs, args.seed, args.download_dir,
+            int(args.shard_tokens), args.batch_docs, args.seed, args.download_dir, args.near_dedup,
         )
         print(json.dumps(meta["filter_stats"]), f"train={meta['train_tokens']:,} val={meta['val_tokens']:,}", flush=True)
         if api is not None:

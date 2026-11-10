@@ -7,6 +7,7 @@ Module names mirror Hugging Face `LlamaForCausalLM` so export is a pure key rena
 from __future__ import annotations
 
 import math
+from collections.abc import Iterator
 
 import torch
 import torch.nn as nn
@@ -49,33 +50,46 @@ def apply_rope(tensor: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> to
 
 
 class KVCache:
-    """Per-layer key/value tensors grown by concatenation during generation."""
+    """Per-layer key/value buffers preallocated to `max_length`; decoding writes in place (no torch.cat per token)."""
 
-    def __init__(self, n_layers: int):
+    def __init__(self, n_layers: int, max_length: int):
+        self.max_length = max_length
         self.keys: list[torch.Tensor | None] = [None] * n_layers
         self.values: list[torch.Tensor | None] = [None] * n_layers
+        self.lengths = [0] * n_layers
 
     @property
     def length(self) -> int:
-        return self.layer_length(0)
+        return self.lengths[0]
 
     def layer_length(self, layer_index: int) -> int:
-        key = self.keys[layer_index]
-        return 0 if key is None else key.shape[2]
+        return self.lengths[layer_index]
 
     def update(self, layer_index: int, key: torch.Tensor, value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.keys[layer_index] is not None:
-            key = torch.cat([self.keys[layer_index], key], dim=2)
-            value = torch.cat([self.values[layer_index], value], dim=2)
-        self.keys[layer_index] = key
-        self.values[layer_index] = value
-        return key, value
+        start = self.lengths[layer_index]
+        end = start + key.shape[2]
+        if end > self.max_length:
+            raise ValueError(f"KV cache overflow: {end} > {self.max_length}")
+        if self.keys[layer_index] is None:
+            batch_size, n_kv_heads, _, head_dim = key.shape
+            self.keys[layer_index] = key.new_empty(batch_size, n_kv_heads, self.max_length, head_dim)
+            self.values[layer_index] = value.new_empty(batch_size, n_kv_heads, self.max_length, head_dim)
+        self.keys[layer_index][:, :, start:end] = key
+        self.values[layer_index][:, :, start:end] = value
+        self.lengths[layer_index] = end
+        return self.keys[layer_index][:, :, :end], self.values[layer_index][:, :, :end]
 
-    def crop(self, max_length: int) -> None:
-        for index, (key, value) in enumerate(zip(self.keys, self.values)):
-            if key is not None:
-                self.keys[index] = key[:, :, -max_length:]
-                self.values[index] = value[:, :, -max_length:]
+
+def padded_attention_mask(attention_mask: torch.Tensor, past_length: int, seq_len: int) -> torch.Tensor:
+    """(batch, total_len) 1/0 token mask -> (batch, 1, seq_len, total_len) bool mask: causal and no padding keys."""
+    key_valid = attention_mask.bool()
+    query_positions = torch.arange(past_length, past_length + seq_len, device=attention_mask.device)
+    key_positions = torch.arange(key_valid.shape[1], device=attention_mask.device)
+    causal = key_positions[None, :] <= query_positions[:, None]
+    allowed = causal[None] & key_valid[:, None, :]
+    # A padding query would see no key at all, and SDPA returns NaN for fully masked rows.
+    allowed |= (key_positions[None, :] == query_positions[:, None])[None]
+    return allowed[:, None]
 
 
 class Attention(nn.Module):
@@ -96,6 +110,7 @@ class Attention(nn.Module):
         sin: torch.Tensor,
         kv_cache: KVCache | None = None,
         layer_index: int = 0,
+        attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch_size, seq_len, _ = hidden.shape
         query = self.q_proj(hidden).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
@@ -117,7 +132,9 @@ class Attention(nn.Module):
             value = value.repeat_interleave(repeat, dim=1)
 
         # T4 (sm75) has no FlashAttention; SDPA falls back to the memory-efficient kernel.
-        if past_length == 0:
+        if attn_mask is not None:
+            attn_out = F.scaled_dot_product_attention(query, key, value, attn_mask=attn_mask)
+        elif past_length == 0:
             attn_out = F.scaled_dot_product_attention(query, key, value, is_causal=True)
         elif seq_len == 1:
             attn_out = F.scaled_dot_product_attention(query, key, value)
@@ -158,8 +175,9 @@ class DecoderLayer(nn.Module):
         sin: torch.Tensor,
         kv_cache: KVCache | None = None,
         layer_index: int = 0,
+        attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        hidden = hidden + self.self_attn(self.input_layernorm(hidden), cos, sin, kv_cache, layer_index)
+        hidden = hidden + self.self_attn(self.input_layernorm(hidden), cos, sin, kv_cache, layer_index, attn_mask)
         hidden = hidden + self.mlp(self.post_attention_layernorm(hidden))
         return hidden
 
@@ -198,22 +216,31 @@ class Transformer(nn.Module):
         input_ids: torch.Tensor,
         targets: torch.Tensor | None = None,
         kv_cache: KVCache | None = None,
+        attention_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """`attention_mask` (batch, past + seq_len), 0 at padding, is only needed for left-padded batches."""
         seq_len = input_ids.shape[1]
         start_position = kv_cache.length if kv_cache is not None else 0
         if start_position + seq_len > self.config.max_seq_len:
             raise ValueError(
                 f"Sequence length {start_position + seq_len} exceeds max_seq_len {self.config.max_seq_len}"
             )
-        cos = self.rope_cos[start_position : start_position + seq_len]
-        sin = self.rope_sin[start_position : start_position + seq_len]
+        attn_mask = None
+        if attention_mask is None:
+            cos = self.rope_cos[start_position : start_position + seq_len]
+            sin = self.rope_sin[start_position : start_position + seq_len]
+        else:
+            # Each row counts positions from its first real token, so left padding does not shift RoPE.
+            positions = (attention_mask.long().cumsum(-1) - 1).clamp(min=0)[:, -seq_len:]
+            cos, sin = self.rope_cos[positions].unsqueeze(1), self.rope_sin[positions].unsqueeze(1)
+            attn_mask = padded_attention_mask(attention_mask, start_position, seq_len)
 
         hidden = self.embed_tokens(input_ids)
         for layer_index, layer in enumerate(self.layers):
             if self.config.gradient_checkpointing and self.training and kv_cache is None:
-                hidden = checkpoint(layer, hidden, cos, sin, use_reentrant=False)
+                hidden = checkpoint(layer, hidden, cos, sin, None, layer_index, attn_mask, use_reentrant=False)
             else:
-                hidden = layer(hidden, cos, sin, kv_cache, layer_index)
+                hidden = layer(hidden, cos, sin, kv_cache, layer_index, attn_mask)
         hidden = self.norm(hidden)
         logits = self.lm_head(hidden)
 
@@ -237,38 +264,100 @@ class Transformer(nn.Module):
         repetition_penalty: float = 1.0,
         eos_token_ids: list[int] | None = None,
         use_cache: bool = True,
+        attention_mask: torch.Tensor | None = None,
+        stop_strings: list[str] | None = None,
+        tokenizer=None,
+        pad_token_id: int | None = None,
     ) -> torch.Tensor:
-        """Sample with a KV cache; temperature <= 0 means greedy decoding."""
+        """Prompt (cut to max_seq_len) + sampled tokens; see `stream_generate` for the arguments."""
+        input_ids = input_ids[:, -self.config.max_seq_len :]
+        if attention_mask is not None:
+            attention_mask = attention_mask[:, -self.config.max_seq_len :]
+        new_tokens = list(self.stream_generate(
+            input_ids, max_new_tokens, temperature, top_p, top_k, repetition_penalty, eos_token_ids, use_cache,
+            attention_mask, stop_strings, tokenizer, pad_token_id,
+        ))
+        return torch.cat([input_ids, *new_tokens], dim=1)
+
+    @torch.no_grad()
+    def stream_generate(
+        self,
+        input_ids: torch.Tensor,
+        max_new_tokens: int,
+        temperature: float = 0.8,
+        top_p: float | None = 0.95,
+        top_k: int | None = None,
+        repetition_penalty: float = 1.0,
+        eos_token_ids: list[int] | None = None,
+        use_cache: bool = True,
+        attention_mask: torch.Tensor | None = None,
+        stop_strings: list[str] | None = None,
+        tokenizer=None,
+        pad_token_id: int | None = None,
+    ) -> Iterator[torch.Tensor]:
+        """Yields each step's next token, shape (batch, 1), until every row has stopped.
+
+        temperature <= 0 is greedy. Batches of different-length prompts are left-padded, with
+        `attention_mask` 0 at the padding. A row stops at an EOS id or once its generated text contains
+        one of `stop_strings` (decoded with `tokenizer`); the stopping token is still yielded, and stopped
+        rows then receive `pad_token_id` (default: the first EOS id) so the batch stays rectangular.
+        """
+        if stop_strings and tokenizer is None:
+            raise ValueError("stop_strings needs a tokenizer to decode the generated tokens")
         max_len = self.config.max_seq_len
         input_ids = input_ids[:, -max_len:]
-        eos_tensor = torch.tensor(eos_token_ids or [], dtype=torch.long, device=input_ids.device)
-        finished = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
+        batch_size, device = input_ids.shape[0], input_ids.device
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
+        attention_mask = attention_mask[:, -max_len:].bool()
+        # Generated tokens are never padding, so an unpadded prompt can keep SDPA's plain causal path.
+        has_padding = not bool(attention_mask.all())
+        eos_tensor = torch.tensor(eos_token_ids or [], dtype=torch.long, device=device)
+        filler_id = pad_token_id if pad_token_id is not None else (eos_token_ids[0] if eos_token_ids else 0)
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+        generated: list[list[int]] = [[] for _ in range(batch_size)]
+        # Every token decodes to at least one character, so a just-completed stop string fits in this tail.
+        stop_window = max(map(len, stop_strings)) + 2 if stop_strings else 0
 
-        kv_cache = KVCache(self.config.n_layers) if use_cache else None
-        logits, _ = self(input_ids, kv_cache=kv_cache)
-        for _ in range(max_new_tokens):
-            next_logits = logits[:, -1, :].float()
+        def forward(ids: torch.Tensor, mask: torch.Tensor, cache: KVCache | None) -> torch.Tensor:
+            return self(ids, kv_cache=cache, attention_mask=mask if has_padding else None)[0]
+
+        cache_length = min(max_len, input_ids.shape[1] + max_new_tokens)
+        kv_cache = KVCache(self.config.n_layers, cache_length) if use_cache else None
+        logits = forward(input_ids, attention_mask, kv_cache)
+        all_ids = input_ids
+        for step in range(max_new_tokens):
             next_token = sample_next_token(
-                next_logits, input_ids, temperature, top_p, top_k, repetition_penalty
+                logits[:, -1, :].float(), all_ids, temperature, top_p, top_k, repetition_penalty
             )
+            next_token = torch.where(finished[:, None], filler_id, next_token)
             if eos_tensor.numel():
-                # Rows that already ended keep emitting EOS so the batch stays rectangular.
-                next_token = torch.where(finished[:, None], eos_tensor[0], next_token)
                 finished |= torch.isin(next_token.squeeze(-1), eos_tensor)
-            input_ids = torch.cat([input_ids, next_token], dim=1)
-            if bool(finished.all()):
-                break
+            if stop_strings:
+                stopped_rows = []
+                done = finished.tolist()
+                for row, token_id in enumerate(next_token.squeeze(-1).tolist()):
+                    if done[row]:
+                        continue
+                    generated[row].append(token_id)
+                    tail = tokenizer.decode(generated[row][-stop_window:])
+                    if any(stop in tail for stop in stop_strings):
+                        stopped_rows.append(row)
+                finished[stopped_rows] = True
+            yield next_token
+            if step == max_new_tokens - 1 or bool(finished.all()):
+                return
 
+            all_ids = torch.cat([all_ids, next_token], dim=1)
+            attention_mask = torch.cat([attention_mask, attention_mask.new_ones(batch_size, 1)], dim=1)
             if kv_cache is None:
-                logits, _ = self(input_ids[:, -max_len:])
+                logits = forward(all_ids[:, -max_len:], attention_mask[:, -max_len:], None)
+            elif kv_cache.length >= kv_cache.max_length:
+                # Sliding the window would change every RoPE position, so recompute the cache.
+                kv_cache = KVCache(self.config.n_layers, max_len)
+                logits = forward(all_ids[:, -(max_len - 1) :], attention_mask[:, -(max_len - 1) :], kv_cache)
             else:
-                if kv_cache.length >= max_len:
-                    # Sliding the window would change every RoPE position, so recompute the cache.
-                    kv_cache = KVCache(self.config.n_layers)
-                    logits, _ = self(input_ids[:, -(max_len - 1) :], kv_cache=kv_cache)
-                else:
-                    logits, _ = self(next_token, kv_cache=kv_cache)
-        return input_ids
+                logits = forward(next_token, attention_mask, kv_cache)
 
 
 def sample_next_token(

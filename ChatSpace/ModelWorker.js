@@ -15,13 +15,34 @@ let tokenizer = null;
 let model = null;
 let maxContext = 1024;
 
-async function load(modelRepo) {
+// int8 ONNX on WebAssembly works in every modern browser. WebGPU runs the fp32 ONNX (same file the export
+// verifies against PyTorch): a bigger download, but several times faster generation on most GPUs.
+const WASM_BACKEND = { device: "wasm", dtype: "q8" };
+const WEBGPU_BACKEND = { device: "webgpu", dtype: "fp32" };
+
+async function webgpuAvailable() {
+  try {
+    return Boolean(self.navigator?.gpu && (await self.navigator.gpu.requestAdapter()));
+  } catch {
+    return false;
+  }
+}
+
+async function load(modelRepo, preferredDevice) {
   const progress_callback = (data) => self.postMessage({ type: "progress", data });
   tokenizer = await AutoTokenizer.from_pretrained(modelRepo, { progress_callback });
-  // int8 ONNX (~135 MB) on WebAssembly works in every modern browser.
-  model = await AutoModelForCausalLM.from_pretrained(modelRepo, { dtype: "q8", device: "wasm", progress_callback });
+  const tryWebgpu = preferredDevice !== "wasm" && (await webgpuAvailable());
+  let backend = tryWebgpu ? WEBGPU_BACKEND : WASM_BACKEND;
+  try {
+    model = await AutoModelForCausalLM.from_pretrained(modelRepo, { ...backend, progress_callback });
+  } catch (error) {
+    if (backend === WASM_BACKEND) throw error;
+    // Missing fp32 file, driver bug or out of GPU memory: the int8 WebAssembly build still works.
+    backend = WASM_BACKEND;
+    model = await AutoModelForCausalLM.from_pretrained(modelRepo, { ...backend, progress_callback });
+  }
   maxContext = model.config.max_position_embeddings ?? maxContext;
-  self.postMessage({ type: "ready" });
+  self.postMessage({ type: "ready", backend: backend.device });
 }
 
 function buildInputs(messages, systemPrompt, maxNewTokens) {
@@ -68,7 +89,7 @@ async function generate({ messages, settings }) {
 self.addEventListener("message", async (event) => {
   const { type } = event.data;
   try {
-    if (type === "load") await load(event.data.modelRepo);
+    if (type === "load") await load(event.data.modelRepo, event.data.device);
     else if (type === "generate") await generate(event.data);
     else if (type === "stop") stoppingCriteria.interrupt();
   } catch (error) {

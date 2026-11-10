@@ -107,7 +107,8 @@ worker.addEventListener("message", (event) => {
     showLoadProgress(message.data);
   } else if (message.type === "ready") {
     modelReady = true;
-    loadStatus.textContent = `Model loaded (${MODEL_REPO}). Replies are generated on your device.`;
+    const backendName = message.backend === "webgpu" ? "WebGPU" : "WebAssembly";
+    loadStatus.textContent = `Model loaded (${MODEL_REPO}, ${backendName}). Replies are generated on your device.`;
     setBusy(false);
   } else if (message.type === "token" && activeReply) {
     activeReply.text += message.text;
@@ -187,4 +188,6 @@ document.querySelectorAll(".example").forEach((button) => {
 });
 
 setBusy(false);
-worker.postMessage({ type: "load", modelRepo: MODEL_REPO });
+// ?device=wasm forces the int8 WebAssembly build (e.g. to compare speed or work around a GPU driver bug).
+const preferredDevice = new URLSearchParams(location.search).get("device");
+worker.postMessage({ type: "load", modelRepo: MODEL_REPO, device: preferredDevice });

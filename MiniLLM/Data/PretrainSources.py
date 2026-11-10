@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import random
+import time
 from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -71,10 +72,27 @@ def list_source_files(spec: SourceSpec, seed: int) -> list[str]:
     return files
 
 
+DOWNLOAD_ATTEMPTS = 5
+
+
 def download_file(spec: SourceSpec, file_path: str, download_dir: str | Path) -> Path:
     from huggingface_hub import hf_hub_download
+    from huggingface_hub.errors import EntryNotFoundError, GatedRepoError, RepositoryNotFoundError
 
-    return Path(hf_hub_download(spec.dataset_path, file_path, repo_type="dataset", local_dir=download_dir))
+    for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+        try:
+            return Path(hf_hub_download(spec.dataset_path, file_path, repo_type="dataset", local_dir=download_dir))
+        except (EntryNotFoundError, GatedRepoError, RepositoryNotFoundError):
+            raise
+        except Exception as error:
+            # Multi-GB files over a CDN fail transiently; one dropped connection must not end a multi-hour job.
+            if attempt == DOWNLOAD_ATTEMPTS:
+                raise
+            wait_seconds = 30 * attempt
+            print(f"[download] {file_path} failed ({type(error).__name__}: {error}); "
+                  f"retry {attempt}/{DOWNLOAD_ATTEMPTS - 1} in {wait_seconds}s", flush=True)
+            time.sleep(wait_seconds)
+    raise AssertionError("unreachable")
 
 
 def iter_parquet_records(spec: SourceSpec, local_path: Path) -> Iterator[dict]:

@@ -52,45 +52,89 @@ def _memmap(path: Path) -> np.memmap:
     return np.memmap(path, dtype=np.uint16, mode="r")
 
 
+def parse_domain_mix(spec: str | None) -> dict[str, float] | None:
+    """'english:0.5,code:0.5' -> {'english': 0.5, 'code': 0.5}."""
+    if not spec:
+        return None
+    mix = {}
+    for part in spec.split(","):
+        name, _, weight = part.partition(":")
+        mix[name.strip()] = float(weight)
+    if any(weight < 0 for weight in mix.values()) or sum(mix.values()) <= 0:
+        raise ValueError(f"Invalid domain_mix {spec!r}")
+    return mix
+
+
 class PretrainSampler:
     """Splits every train shard into fixed windows and visits them in a seeded random order.
 
     Because each source contributes windows in proportion to its token count, a global
     shuffle reproduces the 70/30 English/code mix in every batch on average. A batch is a
     pure function of (micro-step, rank), so resuming only needs the step counter.
+
+    From the second epoch on, each shard's window grid shifts by a random offset (< seq_len),
+    so repeated data is cut at new boundaries instead of being replayed as identical windows.
     """
 
-    def __init__(self, tokens_dir: Path, seq_len: int, seed: int):
+    def __init__(self, tokens_dir: Path, seq_len: int, seed: int, domain_mix: dict[str, float] | None = None):
         self.seq_len = seq_len
         self.seed = seed
         self.shards: list[np.memmap] = []
-        shard_ids, starts = [], []
+        shard_ids, starts, shard_domains = [], [], []
         for meta in load_source_metas(tokens_dir):
             for file_name in meta["train_files"]:
                 shard = _memmap(tokens_dir / file_name)
                 shard_id = len(self.shards)
                 self.shards.append(shard)
-                # +1 token per window for the shifted target.
-                window_count = (len(shard) - 1) // seq_len
+                # +1 token per window for the shifted target, and seq_len - 1 spare tokens for the epoch offset.
+                window_count = max(0, (len(shard) - seq_len) // seq_len)
                 shard_ids.append(np.full(window_count, shard_id, dtype=np.int32))
                 starts.append(np.arange(window_count, dtype=np.int64) * seq_len)
+                shard_domains.append(meta["domain"])
         self.window_shard = np.concatenate(shard_ids)
         self.window_start = np.concatenate(starts)
         self.num_windows = len(self.window_shard)
+        self.domain_mix = domain_mix
+        if domain_mix:
+            missing = set(domain_mix) - set(shard_domains)
+            if missing:
+                raise ValueError(f"domain_mix names domains without shards: {sorted(missing)}")
+            domain_of_shard = np.array([sorted(domain_mix).index(domain) if domain in domain_mix else -1
+                                        for domain in shard_domains])
+            self.window_domain = domain_of_shard[self.window_shard]
         self._epoch = -1
         self._order: np.ndarray | None = None
+        self._shard_offsets = np.zeros(len(self.shards), dtype=np.int64)
 
     def _order_for_epoch(self, epoch: int) -> np.ndarray:
         if epoch != self._epoch:
-            self._order = np.random.default_rng(self.seed + epoch).permutation(self.num_windows)
+            rng = np.random.default_rng(self.seed + epoch)
+            self._order = self._mixed_order(rng) if self.domain_mix else rng.permutation(self.num_windows)
+            # A separate generator, so the visiting order stays what it was before offsets existed.
+            offset_rng = np.random.default_rng([self.seed, epoch])
+            self._shard_offsets = (np.zeros(len(self.shards), dtype=np.int64) if epoch == 0
+                                   else offset_rng.integers(0, self.seq_len, size=len(self.shards)))
             self._epoch = epoch
         return self._order
+
+    def _mixed_order(self, rng: np.random.Generator) -> np.ndarray:
+        """Each position draws a domain by weight, then the next window of that domain (domains cycle if short)."""
+        names = sorted(self.domain_mix)
+        weights = np.array([self.domain_mix[name] for name in names], dtype=np.float64)
+        choices = rng.choice(len(names), size=self.num_windows, p=weights / weights.sum())
+        order = np.empty(self.num_windows, dtype=np.int64)
+        for domain_index in range(len(names)):
+            positions = np.flatnonzero(choices == domain_index)
+            pool = rng.permutation(np.flatnonzero(self.window_domain == domain_index))
+            order[positions] = np.resize(pool, len(positions))
+        return order
 
     def window(self, global_index: int) -> np.ndarray:
         epoch, position = divmod(global_index, self.num_windows)
         window_id = self._order_for_epoch(epoch)[position]
-        shard = self.shards[self.window_shard[window_id]]
-        start = self.window_start[window_id]
+        shard_id = self.window_shard[window_id]
+        shard = self.shards[shard_id]
+        start = self.window_start[window_id] + self._shard_offsets[shard_id]
         return np.asarray(shard[start : start + self.seq_len + 1], dtype=np.int64)
 
     def get_batch(

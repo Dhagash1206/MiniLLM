@@ -28,6 +28,8 @@ def test_checkpoints_keep_newest_and_write_fp16_milestones(tmp_path):
                                max_seq_len=16)
     model = Transformer(config.model)
     optimizer = torch.optim.AdamW(model.parameters())
+    model(torch.zeros((1, 4), dtype=torch.long), torch.zeros((1, 4), dtype=torch.long))[1].backward()
+    optimizer.step()  # so the saved optimizer state holds real moment tensors
     manager = CheckpointManager(tmp_path, hub_repo=None, push=False, private=True, squash=False,
                                 path_in_repo="pretrain", keep_last=2, milestone_interval=40)
     for step in (20, 40, 60, 70):
@@ -39,6 +41,9 @@ def test_checkpoints_keep_newest_and_write_fp16_milestones(tmp_path):
     milestone_weights = torch.load(tmp_path / "milestones" / "step-00040-fp16" / "model.pt")
     assert all(tensor.dtype == torch.float16 for tensor in milestone_weights.values())
 
+    # Resume uses the safe (no-pickle) loader for optimizer state as well as weights.
+    training_state = torch.load(tmp_path / "step-00070" / "training_state.pt", weights_only=True)
+    optimizer.load_state_dict(training_state["optimizer"])
     assert manager.find_resume_dir() == tmp_path / "step-00070"
     assert resolve_checkpoint(str(tmp_path / "latest")) == tmp_path / "step-00070"
     reloaded, _ = load_model_weights(tmp_path / "milestones" / "step-00040-fp16")

@@ -1,7 +1,7 @@
-"""MBPP (sanitized test split) pass@1 with greedy decoding.
+"""MBPP (sanitized test split) pass@1 with batched greedy decoding.
 
-Generated code is executed in a subprocess with a timeout. Run this only on a disposable
-machine (Kaggle/Colab), never on a machine with secrets you care about.
+Generated code runs in a resource-capped subprocess with an empty environment (see Common.run_python),
+which still allows network and file access: prefer a disposable machine (Kaggle/Colab).
 
 Usage:
     python -m MiniLLM.Evaluation.MBPP --model checkpoints/sft/latest --chat
@@ -13,15 +13,11 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import subprocess
-import sys
-import tempfile
 from pathlib import Path
 
-import torch
-
-from MiniLLM.Evaluation.TextGeneration import generate_text
-from MiniLLM.HFExport import load_any_model
+from MiniLLM.Evaluation.Common import (CODE_STOP_STRINGS, load_eval_model, load_eval_tokenizer, pick_device,
+                                      run_python, truncate_completion)
+from MiniLLM.Evaluation.TextGeneration import generate_texts
 
 CODE_BLOCK = re.compile(r"```(?:python|py)?\s*\n(.*?)(?:```|$)", re.DOTALL)
 
@@ -40,52 +36,41 @@ def extract_code(completion: str, prompt: str, chat: bool) -> str:
     if chat:
         match = CODE_BLOCK.search(completion)
         return match.group(1) if match else completion
-    code = prompt.split('"""\n\n', 1)[1] + completion
-    # Stop at the first top-level statement that is not part of the function body.
-    lines = code.splitlines()
-    kept = [lines[0]]
-    for line in lines[1:]:
-        if line and not line[0].isspace() and not line.startswith(("def ", "class ", "import ", "from ", "#", "@")):
-            break
-        kept.append(line)
-    return "\n".join(kept)
+    signature, _, body = (prompt.split('"""\n\n', 1)[1] + completion).partition("\n")
+    return signature + "\n" + truncate_completion(body)
 
 
 def passes_tests(code: str, problem: dict, timeout_seconds: float = 10.0) -> bool:
     imports = "\n".join(problem.get("test_imports") or [])
     program = "\n".join([imports, code, "", *problem["test_list"]])
-    with tempfile.TemporaryDirectory() as work_dir:
-        script = Path(work_dir) / "candidate.py"
-        script.write_text(program)
-        try:
-            result = subprocess.run([sys.executable, "-I", str(script)], cwd=work_dir, capture_output=True,
-                                    timeout=timeout_seconds)
-        except subprocess.TimeoutExpired:
-            return False
-    return result.returncode == 0
+    return run_python(program, timeout_seconds)
 
 
-def run(model_path: str, tokenizer_dir: str, chat: bool, limit: int | None, output: str) -> dict:
+def run(model_path: str, tokenizer_dir: str | None, chat: bool, limit: int | None, output: str,
+        batch_size: int = 16) -> dict:
     from datasets import load_dataset
-    from transformers import AutoTokenizer
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = load_any_model(model_path, device)
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir)
+    device = pick_device()
+    model = load_eval_model(model_path, device)
+    tokenizer = load_eval_tokenizer(model_path, tokenizer_dir)
     problems = list(load_dataset("google-research-datasets/mbpp", "sanitized", split="test"))
     if limit:
         problems = problems[:limit]
 
     records, passed = [], 0
-    for index, problem in enumerate(problems, start=1):
-        prompt = build_prompt(problem, chat)
-        completion = generate_text(model, tokenizer, prompt, device, chat=chat, max_new_tokens=384)
-        code = extract_code(completion, prompt, chat)
-        success = passes_tests(code, problem)
-        passed += success
-        records.append({"task_id": problem["task_id"], "passed": success, "code": code})
-        if index % 50 == 0:
-            print(f"{index}/{len(problems)} pass@1={passed / index:.4f}", flush=True)
+    # Chunks of several batches keep progress visible while the length sort still has prompts to group.
+    chunk_size = batch_size * 4
+    for chunk_start in range(0, len(problems), chunk_size):
+        chunk = problems[chunk_start : chunk_start + chunk_size]
+        prompts = [build_prompt(problem, chat) for problem in chunk]
+        completions = generate_texts(model, tokenizer, prompts, device, chat=chat, max_new_tokens=384,
+                                     stop_strings=None if chat else CODE_STOP_STRINGS, batch_size=batch_size)
+        for problem, prompt, completion in zip(chunk, prompts, completions):
+            code = extract_code(completion, prompt, chat)
+            success = passes_tests(code, problem)
+            passed += success
+            records.append({"task_id": problem["task_id"], "passed": success, "code": code})
+        print(f"{len(records)}/{len(problems)} pass@1={passed / len(records):.4f}", flush=True)
 
     results = {"mbpp_pass@1": passed / len(problems), "mbpp_n": len(problems), "chat_prompt": chat}
     Path(output).parent.mkdir(parents=True, exist_ok=True)
@@ -97,12 +82,13 @@ def run(model_path: str, tokenizer_dir: str, chat: bool, limit: int | None, outp
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--model", required=True)
-    parser.add_argument("--tokenizer", default="data/tokens/tokenizer")
+    parser.add_argument("--tokenizer", default=None, help="Required for MiniLLM checkpoints")
     parser.add_argument("--chat", action="store_true", help="Use the chat template (for SFT/DPO models)")
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--output", default="results/mbpp.json")
     args = parser.parse_args()
-    run(args.model, args.tokenizer, args.chat, args.limit, args.output)
+    run(args.model, args.tokenizer, args.chat, args.limit, args.output, args.batch_size)
 
 
 if __name__ == "__main__":

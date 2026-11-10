@@ -19,7 +19,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 
 from MiniLLM.Config import load_config
-from MiniLLM.Data.ShardLoader import PretrainSampler, ValidationSet, ensure_tokens_available
+from MiniLLM.Data.ShardLoader import PretrainSampler, ValidationSet, ensure_tokens_available, parse_domain_mix
 from MiniLLM.Model import Transformer, configure_optimizer
 from MiniLLM.Training.TrainingUtils import (
     CheckpointManager,
@@ -98,7 +98,8 @@ def main() -> None:
     tokens_dir = ensure_tokens_available(config.data.tokens_dir, config.data.hub_repo)
 
     seq_len = config.model.max_seq_len
-    sampler = PretrainSampler(tokens_dir, seq_len, seed=config.data.seed)
+    sampler = PretrainSampler(tokens_dir, seq_len, seed=config.data.seed,
+                              domain_mix=parse_domain_mix(config.data.domain_mix))
     validation = ValidationSet(tokens_dir, seq_len)
 
     tokens_per_micro_step = config.train.micro_batch_size * seq_len * dist_info.world_size
@@ -111,6 +112,9 @@ def main() -> None:
     def autocast_ctx():
         if use_cuda:
             return torch.autocast(device_type="cuda", dtype=torch.float16)
+        if dist_info.device.type == "mps":
+            # bf16 needs no loss scaling and is ~1.8x faster than fp32 on Apple GPUs.
+            return torch.autocast(device_type="mps", dtype=torch.bfloat16)
         return contextlib.nullcontext()
 
     scaler = torch.amp.GradScaler("cuda", enabled=use_cuda)
@@ -135,7 +139,8 @@ def main() -> None:
     if resume_dir is not None:
         state = json.loads((resume_dir / "state.json").read_text())
         model.load_state_dict(torch.load(resume_dir / "model.pt", map_location=dist_info.device, weights_only=True))
-        training_state = torch.load(resume_dir / "training_state.pt", map_location=dist_info.device, weights_only=False)
+        # Optimizer/scaler state is tensors and plain values only, so the safe loader needs no pickle.
+        training_state = torch.load(resume_dir / "training_state.pt", map_location=dist_info.device, weights_only=True)
         optimizer.load_state_dict(training_state["optimizer"])
         if training_state["scaler"] and use_cuda:
             scaler.load_state_dict(training_state["scaler"])

@@ -2,6 +2,7 @@
 
 Usage:
     python -m MiniLLM.Evaluation.HellaSwag --model checkpoints/pretrain/latest --tokenizer data/tokens/tokenizer
+    python -m MiniLLM.Evaluation.HellaSwag --model hf:openai-community/gpt2        # baseline
 """
 
 from __future__ import annotations
@@ -12,7 +13,7 @@ import json
 import torch
 import torch.nn.functional as F
 
-from MiniLLM.HFExport import load_any_model
+from MiniLLM.Evaluation.Common import autocast_context, load_eval_model, load_eval_tokenizer, pick_device
 
 
 def load_examples() -> list[dict]:
@@ -35,7 +36,7 @@ def score_example(model, tokenizer, example: dict, device) -> tuple[int, int]:
         mask[row, len(context_ids) : len(sequence)] = True
     tokens, mask = tokens.to(device), mask.to(device)
 
-    with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
+    with autocast_context(device):
         logits, _ = model(tokens)
     shift_logits = logits[:, :-1].float()
     shift_targets = tokens[:, 1:]
@@ -46,12 +47,10 @@ def score_example(model, tokenizer, example: dict, device) -> tuple[int, int]:
     return int(sum_loss.argmin()), int(mean_loss.argmin())
 
 
-def run(model_path: str, tokenizer_dir: str, limit: int | None = None) -> dict[str, float]:
-    from transformers import AutoTokenizer
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = load_any_model(model_path, device)
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir)
+def run(model_path: str, tokenizer_dir: str | None, limit: int | None = None) -> dict[str, float]:
+    device = pick_device()
+    model = load_eval_model(model_path, device)
+    tokenizer = load_eval_tokenizer(model_path, tokenizer_dir)
     examples = load_examples()[:limit] if limit else load_examples()
 
     correct, correct_norm = 0, 0
@@ -71,7 +70,7 @@ def run(model_path: str, tokenizer_dir: str, limit: int | None = None) -> dict[s
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--model", required=True)
-    parser.add_argument("--tokenizer", default="data/tokens/tokenizer")
+    parser.add_argument("--tokenizer", default=None, help="Required for MiniLLM checkpoints")
     parser.add_argument("--limit", type=int, default=None)
     args = parser.parse_args()
     run(args.model, args.tokenizer, args.limit)

@@ -1,4 +1,5 @@
 import json
+import os
 
 import numpy as np
 from tokenizers import Tokenizer
@@ -11,7 +12,7 @@ from MiniLLM.Data.DocumentFilters import (
     english_quality_ok,
     license_ok,
 )
-from MiniLLM.Data.ShardLoader import PretrainSampler, ValidationSet
+from MiniLLM.Data.ShardLoader import PretrainSampler, ValidationSet, parse_domain_mix
 
 GOOD_CODE = "import os\n\n\ndef list_files(path):\n    \"\"\"Return file names.\"\"\"\n    return sorted(os.listdir(path))\n" * 3
 MIT_RECORD = {"max_stars_repo_licenses": ["MIT"]}
@@ -115,6 +116,48 @@ def test_sampler_deterministic_and_mixed(tmp_path):
     assert len(list(validation.batches("code", 10, 2, 0, 1, torch.device("cpu")))) == 3
 
 
+def test_later_epochs_shift_window_boundaries(tmp_path):
+    seq_len = 32
+    write_fake_shards(tmp_path, seq_len)
+    sampler = PretrainSampler(tmp_path, seq_len, seed=3)
+    first_epoch = [sampler.window(index) for index in range(sampler.num_windows)]
+    assert all(len(window) == seq_len + 1 for window in first_epoch)
+    sampler._order_for_epoch(0)
+    assert not sampler._shard_offsets.any()  # epoch 0 starts every window on the plain grid
+    offsets = []
+    for epoch in (1, 2, 3):
+        sampler._order_for_epoch(epoch)
+        offsets.append(tuple(sampler._shard_offsets))
+    assert len(set(offsets)) > 1 and all(0 <= offset < seq_len for group in offsets for offset in group)
+    # Every window of a shifted epoch stays inside its shard and still has seq_len + 1 tokens.
+    second_epoch = [sampler.window(sampler.num_windows + index) for index in range(sampler.num_windows)]
+    assert all(len(window) == seq_len + 1 for window in second_epoch)
+    assert {window.tobytes() for window in first_epoch} != {window.tobytes() for window in second_epoch}
+
+
+def test_domain_mix_resamples_windows(tmp_path):
+    seq_len = 32
+    write_fake_shards(tmp_path, seq_len)
+    sampler = PretrainSampler(tmp_path, seq_len, seed=3, domain_mix=parse_domain_mix("english:0.5,code:0.5"))
+    order = sampler._order_for_epoch(0)
+    code_fraction = np.mean(sampler.window_shard[order] == 1)
+    assert abs(code_fraction - 0.5) < 0.1  # natural mix would be ~0.3
+    again = PretrainSampler(tmp_path, seq_len, seed=3, domain_mix=parse_domain_mix("english:0.5,code:0.5"))
+    assert np.array_equal(order, again._order_for_epoch(0))
+    assert parse_domain_mix(None) is None
+
+
+def test_near_dedup_catches_edits_but_not_distinct_docs():
+    words = [f"word{index % 97}" for index in range(400)]
+    original = " ".join(words)
+    lightly_edited = " ".join(words[:392] + ["changed"] * 8)
+    different = " ".join(f"other{index}" for index in range(400))
+    exact_only, near = Deduplicator(), Deduplicator(near_duplicates=True)
+    assert not exact_only.is_duplicate(original) and not exact_only.is_duplicate(lightly_edited)
+    assert not near.is_duplicate(original)
+    assert near.is_duplicate(lightly_edited)
+    assert not near.is_duplicate(different)
+
 def test_mbpp_harness_accepts_reference_and_rejects_wrong():
     from MiniLLM.Evaluation.MBPP import extract_code, passes_tests
 
@@ -122,5 +165,9 @@ def test_mbpp_harness_accepts_reference_and_rejects_wrong():
     assert passes_tests("def add(a, b):\n    return a + b", problem)
     assert not passes_tests("def add(a, b):\n    return a - b", problem)
     assert not passes_tests("while True:\n    pass", problem, timeout_seconds=1)
+    # The sandbox hands generated code an empty environment and forbids new processes.
+    assert passes_tests("import os\nassert 'HF_TOKEN' not in os.environ\ndef add(a, b):\n    return a + b", problem)
+    if os.geteuid() != 0:  # RLIMIT_NPROC does not bind root (e.g. inside Docker or on Kaggle)
+        assert not passes_tests("import os\nos.fork()\ndef add(a, b):\n    return a + b", problem)
     completion = "Here you go:\n```python\ndef add(a, b):\n    return a + b\n```\nDone."
     assert extract_code(completion, "", chat=True).strip() == "def add(a, b):\n    return a + b"

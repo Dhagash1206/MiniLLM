@@ -27,6 +27,7 @@ from MiniLLM.LoRA import apply_lora, lora_state_dict, merged_state_dict
 from MiniLLM.Model import configure_optimizer
 from MiniLLM.Training.TrainingUtils import (
     CheckpointManager,
+    LossHealthGuard,
     Timer,
     WandbLogger,
     all_reduce_mean,
@@ -69,10 +70,11 @@ def checkpoint_payload(model, section) -> tuple[dict, dict]:
 
 def restore_training_state(resume_dir, model, optimizer, scaler, section, device) -> dict:
     if section.lora_enabled:
-        model.load_state_dict(torch.load(resume_dir / "lora_adapter.pt", map_location=device), strict=False)
+        model.load_state_dict(torch.load(resume_dir / "lora_adapter.pt", map_location=device, weights_only=True),
+                              strict=False)
     else:
         model.load_state_dict(torch.load(resume_dir / "model.pt", map_location=device, weights_only=True))
-    training_state = torch.load(resume_dir / "training_state.pt", map_location=device, weights_only=False)
+    training_state = torch.load(resume_dir / "training_state.pt", map_location=device, weights_only=True)
     optimizer.load_state_dict(training_state["optimizer"])
     if training_state["scaler"] and device.type == "cuda":
         scaler.load_state_dict(training_state["scaler"])
@@ -111,7 +113,11 @@ def main() -> None:
     use_cuda = dist_info.device.type == "cuda"
 
     def autocast_ctx():
-        return torch.autocast("cuda", dtype=torch.float16) if use_cuda else contextlib.nullcontext()
+        if use_cuda:
+            return torch.autocast("cuda", dtype=torch.float16)
+        if dist_info.device.type == "mps":
+            return torch.autocast("mps", dtype=torch.bfloat16)
+        return contextlib.nullcontext()
 
     if dist_info.is_main:
         ensure_tokenizer_available(config.data)
@@ -182,11 +188,18 @@ def main() -> None:
         raw_model.train()
         return (loss_sum / token_count.clamp(min=1)).item()
 
+    health = LossHealthGuard(section.loss_spike_threshold)
     saved_steps: set[int] = set()
 
     def save_checkpoint(next_step: int, force: bool = False) -> None:
-        # Skips a duplicate save when the interval save already covered the final step.
-        if dist_info.is_main and next_step not in saved_steps:
+        # Loss is all-reduced every step, so every rank reaches the same decision here.
+        if next_step in saved_steps:
+            pass  # the interval save already covered the final step
+        elif not health.safe_to_save(next_step):
+            if dist_info.is_main:
+                print(f"[ckpt] SFT loss unhealthy recently; NOT saving step {next_step} (keeping older checkpoints)",
+                      flush=True)
+        elif dist_info.is_main:
             model_state, extra_files = checkpoint_payload(raw_model, section)
             state = {"step": next_step, "total_steps": total_steps, "wandb_run_id": logger.run_id if logger else None}
             if checkpoints.save(raw_model, optimizer, scaler if use_cuda else None, state, config, force=force,
@@ -237,12 +250,16 @@ def main() -> None:
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
             completed_steps = step + 1
+            all_reduce_mean(loss_accum)
+            step_loss = loss_accum.item()
+            if not health.update(completed_steps, step_loss) and dist_info.is_main:
+                print(f"[health] sft step {completed_steps} loss {step_loss:.4f} vs average "
+                      f"{health.loss_ema or 0:.4f}; checkpoint saving paused", flush=True)
 
             if completed_steps % section.log_interval == 0:
-                all_reduce_mean(loss_accum)
                 if dist_info.is_main:
                     elapsed = time.time() - window_start
-                    metrics = {"sft/loss": loss_accum.item(), "sft/lr": learning_rate,
+                    metrics = {"sft/loss": step_loss, "sft/lr": learning_rate,
                                "sft/grad_norm": grad_norm.item(), "sft/epoch": epoch + step_in_epoch / steps_per_epoch,
                                "sft/target_tokens_per_sec": tokens_in_window * dist_info.world_size / elapsed}
                     print(f"sft step {completed_steps}/{total_steps} loss {metrics['sft/loss']:.4f} "

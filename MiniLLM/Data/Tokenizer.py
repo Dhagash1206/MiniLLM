@@ -106,13 +106,14 @@ def load_tokenizer(tokenizer_dir: str | Path):
     return AutoTokenizer.from_pretrained(str(tokenizer_dir))
 
 
-def mixed_sample_iterator(docs_per_source: int, seed: int):
+def mixed_sample_iterator(docs_per_source: int, seed: int, source_names: list[str] | None = None):
     from MiniLLM.Data.PretrainSources import PRETRAIN_SOURCES, iter_documents
 
+    specs = [spec for spec in PRETRAIN_SOURCES if source_names is None or spec.name in source_names]
     # Weight sources by their pretraining mix so merges reflect the 70/30 split.
-    max_fraction = max(spec.mix_fraction for spec in PRETRAIN_SOURCES)
+    max_fraction = max(spec.mix_fraction for spec in specs)
     streams = []
-    for spec in PRETRAIN_SOURCES:
+    for spec in specs:
         doc_count = max(1, int(docs_per_source * spec.mix_fraction / max_fraction))
         # A different shuffle seed than pretraining gives a different shard order (skip() would download everything).
         stream = iter_documents(spec, seed=seed + 7)
@@ -158,13 +159,14 @@ def main() -> None:
     parser.add_argument("--push-to-hub", default=None, help="Optional HF repo id to upload the tokenizer to")
     parser.add_argument("--reuse-from-hub", default=None,
                         help="HF dataset repo; if it already has tokenizer/, download that instead of training")
+    parser.add_argument("--sources", nargs="+", default=None, help="Train on these sources only (default: all)")
     args = parser.parse_args()
 
     if args.reuse_from_hub and download_hub_tokenizer(args.reuse_from_hub, args.out):
         print(f"Reused tokenizer from datasets/{args.reuse_from_hub}/tokenizer -> {args.out}")
         return
 
-    tokenizer = train_tokenizer(mixed_sample_iterator(args.docs_per_source, args.seed), args.vocab_size)
+    tokenizer = train_tokenizer(mixed_sample_iterator(args.docs_per_source, args.seed, args.sources), args.vocab_size)
     save_tokenizer(tokenizer, args.out)
     print(f"Saved tokenizer ({tokenizer.get_vocab_size()} tokens) to {args.out}")
 

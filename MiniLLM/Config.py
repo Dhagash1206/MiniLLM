@@ -38,6 +38,9 @@ class DataConfig:
     hub_repo: str | None = None
     tokenizer_dir: str = "artifacts/tokenizer"
     seed: int = 1234
+    # Ablations: resample training windows to this domain mix, e.g. "english:0.5,code:0.5".
+    # None keeps the natural mix (each source in proportion to its token count).
+    domain_mix: str | None = None
 
 
 @dataclass
@@ -106,6 +109,8 @@ class SFTConfig:
     log_interval: int = 10
     checkpoint_interval: int = 500
     max_runtime_hours: float = 11.25
+    # Looser than pretraining: SFT batches mix chat and code, so per-step loss is noisier.
+    loss_spike_threshold: float = 1.0
     lora_enabled: bool = False
     lora_rank: int = 16
     lora_alpha: float = 32.0

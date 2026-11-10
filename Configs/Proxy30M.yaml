@@ -1,0 +1,48 @@
+# ~27M-param proxy for cheap ablations (Scripts/RunAblations.py); same data/tokenizer as the main run.
+# Results transfer qualitatively, not exactly: use it to rank choices, then confirm the winner at full size.
+
+model:
+  vocab_size: 32768
+  dim: 384
+  n_layers: 8
+  n_heads: 6
+  n_kv_heads: 6                 # ablation: 2 = grouped-query attention (3 query heads per KV head)
+  ffn_hidden_dim: 1024
+  max_seq_len: 512
+  rope_theta: 10000.0
+  tie_embeddings: true
+
+data:
+  tokens_dir: data/tokens
+  hub_repo: ${HF_USERNAME}/minillm-tokens
+  tokenizer_dir: data/tokens/tokenizer
+  seed: 1234
+  domain_mix: null              # ablation: e.g. "english:0.5,code:0.5"
+
+train:
+  total_tokens: 200000000       # ~7 tokens/param: enough to separate variants, not to converge
+  micro_batch_size: 16
+  tokens_per_step: 131072
+  max_lr: 1.0e-3
+  min_lr_ratio: 0.1
+  warmup_steps: 100
+  weight_decay: 0.1
+  grad_clip: 1.0
+  eval_interval: 200
+  eval_batches: 40
+  log_interval: 20
+  sample_interval: 100000       # no sample previews
+  checkpoint_interval: 500
+  max_runtime_hours: 11.25
+  checkpoint_dir: checkpoints_ablations/base
+  keep_checkpoints: 1
+  milestone_interval: 1000000
+  compile: false
+
+hub:
+  checkpoint_repo: null
+  push_checkpoints: false
+
+wandb:
+  enabled: false
+  project: minillm-ablations

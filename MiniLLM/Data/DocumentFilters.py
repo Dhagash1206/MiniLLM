@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import re
 
+import numpy as np
+
 # Matches high-confidence credential formats; files containing any are dropped entirely.
 SECRET_PATTERNS = [
     re.compile(r"AKIA[0-9A-Z]{16}"),  # AWS access key id
@@ -50,13 +52,66 @@ def normalized_hash(text: str) -> bytes:
     return hashlib.blake2b(normalized.encode("utf-8", errors="ignore"), digest_size=8).digest()
 
 
+class MinHashLSH:
+    """Near-duplicate detector: MinHash signatures over word 5-grams, banded LSH lookup.
+
+    With 16 bands x 8 rows, a pair with Jaccard similarity s collides with probability
+    1 - (1 - s^8)^16: ~0.9 at s=0.8 and ~0.1 at s=0.6, i.e. a soft threshold around 0.7.
+    Memory is ~16 small ints per kept document (roughly 1.5 GB per million documents).
+    """
+
+    MERSENNE_PRIME = np.uint64((1 << 61) - 1)
+    MAX_HASH = np.uint64((1 << 32) - 1)
+
+    def __init__(self, num_bands: int = 16, rows_per_band: int = 8, shingle_words: int = 5, seed: int = 1):
+        self.num_bands = num_bands
+        self.rows_per_band = rows_per_band
+        self.shingle_words = shingle_words
+        num_perm = num_bands * rows_per_band
+        rng = np.random.default_rng(seed)
+        self.perm_a = rng.integers(1, int(self.MERSENNE_PRIME), size=num_perm, dtype=np.uint64)
+        self.perm_b = rng.integers(0, int(self.MERSENNE_PRIME), size=num_perm, dtype=np.uint64)
+        self.band_keys: set[int] = set()
+
+    def signature(self, text: str) -> np.ndarray:
+        words = text.lower().split()
+        width = self.shingle_words
+        shingles = {" ".join(words[index : index + width]) for index in range(max(1, len(words) - width + 1))}
+        shingle_hashes = np.fromiter(
+            (int.from_bytes(hashlib.blake2b(shingle.encode("utf-8", errors="ignore"), digest_size=4).digest(),
+                            "little") for shingle in shingles),
+            dtype=np.uint64, count=len(shingles),
+        )
+        # Universal hashing (a*h + b) mod p; uint64 overflow wraps, which still mixes bits well (as in datasketch).
+        with np.errstate(over="ignore"):
+            permuted = (np.outer(shingle_hashes, self.perm_a) + self.perm_b) % self.MERSENNE_PRIME
+        return (permuted & self.MAX_HASH).min(axis=0)
+
+    def is_duplicate(self, text: str) -> bool:
+        bands = self.signature(text).reshape(self.num_bands, self.rows_per_band)
+        keys = [
+            int.from_bytes(hashlib.blake2b(band_index.to_bytes(2, "little") + band.tobytes(), digest_size=8).digest(),
+                           "little")
+            for band_index, band in enumerate(bands)
+        ]
+        if any(key in self.band_keys for key in keys):
+            return True
+        self.band_keys.update(keys)
+        return False
+
+
 class Deduplicator:
-    def __init__(self) -> None:
+    """Exact dedup (normalized hash) always; MinHash near-dedup when `near_duplicates=True`."""
+
+    def __init__(self, near_duplicates: bool = False) -> None:
         self.seen_hashes: set[bytes] = set()
+        self.near = MinHashLSH() if near_duplicates else None
 
     def is_duplicate(self, text: str) -> bool:
         digest = normalized_hash(text)
         if digest in self.seen_hashes:
+            return True
+        if self.near is not None and self.near.is_duplicate(text):
             return True
         self.seen_hashes.add(digest)
         return False

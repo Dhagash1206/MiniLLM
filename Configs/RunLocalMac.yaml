@@ -1,0 +1,62 @@
+# Fast local run on an Apple Silicon Mac (MPS), no HF / W&B login needed.
+# ~42M params, 100M English tokens from Scripts/PrepareDataLocal.sh (TOTAL_TOKENS=1.6e8); ~3 h.
+
+model:
+  vocab_size: 32768
+  dim: 512
+  n_layers: 8
+  n_heads: 8
+  n_kv_heads: 8
+  ffn_hidden_dim: 1408
+  max_seq_len: 512
+  rope_theta: 10000.0
+  tie_embeddings: true
+  gradient_checkpointing: false
+
+data:
+  tokens_dir: data/local_step1/tokens_fineweb_edu
+  hub_repo: null
+  tokenizer_dir: data/local_step1/tokens_fineweb_edu/tokenizer
+  seed: 1234
+
+train:
+  total_tokens: 100000000     # ~3 h at ~9k tok/s (bf16, M5)
+  micro_batch_size: 16
+  tokens_per_step: 65536        # 16 x 512 x 8 accumulation steps
+  max_lr: 1.0e-3
+  min_lr_ratio: 0.1
+  warmup_steps: 100
+  weight_decay: 0.1
+  grad_clip: 1.0
+  eval_interval: 250
+  eval_batches: 20
+  log_interval: 10
+  sample_interval: 500
+  checkpoint_interval: 250
+  max_runtime_hours: 48
+  checkpoint_dir: checkpoints_local
+  keep_checkpoints: 2
+  milestone_interval: 1000
+  loss_spike_threshold: 0.5
+  compile: false
+
+hub:
+  checkpoint_repo: null
+  push_checkpoints: false
+
+wandb:
+  enabled: false
+
+sft:
+  init_checkpoint: checkpoints_local/pretrain/latest
+  output_dir: checkpoints_local/sft
+  epochs: 1
+  micro_batch_size: 8
+  grad_accum_steps: 4
+  max_lr: 1.0e-4
+  warmup_steps: 50
+  max_seq_len: 512
+  datasets:
+    - {name: HuggingFaceTB/smol-smoltalk, split: train, samples: 50000}
+  lora_enabled: false
+  max_runtime_hours: 48
