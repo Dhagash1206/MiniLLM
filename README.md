@@ -21,7 +21,7 @@ For local development:
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-pytest -q                                   # 29 tests: model, KV cache, batching, HF/GGUF export, checkpoints, data, evals
+pytest -q                                   # 40 tests: model, KV cache, batching, HF/GGUF export, checkpoints, data, evals, RAG
 python Scripts/MakeDebugData.py           # offline tiny dataset
 python -m MiniLLM.Training.Pretrain --config Configs/SmokeTest.yaml
 ```
@@ -52,6 +52,7 @@ python -m MiniLLM.Training.Pretrain --config Configs/SmokeTest.yaml
   - Perplexity on the English and code validation shards
   - Your own prompts in [EvalPrompts/CustomPrompts.jsonl](EvalPrompts/CustomPrompts.jsonl)
   - [RunSuite.py](MiniLLM/Evaluation/RunSuite.py) runs all of them for one model; `hf:<repo>` models (GPT-2, SmolLM2) go through the same harness as baselines. [Report.py](MiniLLM/Evaluation/Report.py) turns the scores and training log into `RESULTS.md`, `MODEL_CARD.md` and a loss-curve SVG.
+- **RAG** ([MiniLLM/RAG/](MiniLLM/RAG/)): MiniLLM answers questions from Wikipedia passages. It fetches and caches articles, chunks them with the project tokenizer and ranks passages with from-scratch BM25. The passages go into a prompt that fits the 1024-token context. It uses only the standard library, with no fine-tuning. See [Answering from Wikipedia](#answering-from-wikipedia-rag).
 - **Demo** ([ChatSpace/](ChatSpace/)): a static Space (free for every account). [OnnxExport.py](MiniLLM/OnnxExport.py) exports the model to ONNX with a KV cache (fp32, plus int8 at ~135 MB), and Transformers.js runs it in a Web Worker in the visitor's browser: on WebGPU when available, otherwise int8 on WebAssembly (`?device=wasm` forces it). Deployed by [Scripts/DeploySpace.py](Scripts/DeploySpace.py).
 
 ## Commands
@@ -131,6 +132,45 @@ llama-quantize artifacts/minillm-f16.gguf artifacts/minillm-q8_0.gguf Q8_0
 llama.cpp has no exact equivalent of MiniLLM's split rule that isolates indentation, so leading code indentation may tokenize slightly differently there.
 
 For LoRA instead of full fine-tuning, add `sft.lora_enabled=true` to the SFT command. `.../latest` always means the newest `step-XXXXX` folder.
+
+## Answering from Wikipedia (RAG)
+
+[MiniLLM/RAG/](MiniLLM/RAG/) gives the model facts at question time instead of training them in. It uses Wikipedia, BM25 and the standard library only, with no fine-tuning.
+
+1. **Fetch** ([WikiSource.py](MiniLLM/RAG/WikiSource.py)): search the Wikipedia API with the question's content words. Download the top 4 articles as plain text and cache them in `data/wiki_cache/`. Requests are spaced 1 s apart, and HTTP 429 and 5xx responses are retried, honouring `Retry-After`.
+2. **Chunk** ([Chunker.py](MiniLLM/RAG/Chunker.py)): split articles at their `== Section ==` headings and drop reference-style sections. Pack the text into ~160-token passages, overlapping by 32 tokens and counted with the project tokenizer.
+3. **Rank** ([BM25.py](MiniLLM/RAG/BM25.py)): BM25 written from scratch. Opening passages, which summarize an article's key facts, get a 1.5× boost. The top 3 passages are kept, at most 2 per article.
+4. **Answer** ([Answer.py](MiniLLM/RAG/Answer.py)):
+   - The passages go into the prompt: the ChatML prompt for SFT/DPO models, and a plain `Question: … Answer:` prompt for base checkpoints.
+   - The prompt and answer together fit a 1024-token budget, capped at the model's context. Lower-ranked passages are dropped first, then the best one is trimmed.
+   - The answer comes from `generate_text`, with greedy decoding.
+
+```bash
+python -m MiniLLM.RAG.Answer "What is the capital of Australia?"
+python -m MiniLLM.RAG.Answer --compare --show-passages "Who wrote Pride and Prejudice?"   # with vs without retrieval
+python -m MiniLLM.RAG.Answer --model checkpoints/sft/latest --offline "..."            # cached pages only
+python -m MiniLLM.RAG.Compare                       # EvalPrompts/RagQuestions.jsonl -> results/rag_comparison.md
+```
+
+`--model` defaults to the newest local checkpoint (SFT before pretrain). It also accepts `hf:<repo>`, so you can compare against a baseline through the same pipeline. Set `WIKI_USER_AGENT` to identify yourself to Wikimedia if you fetch many pages. [Tests/RagTests.py](Tests/RagTests.py) runs offline on saved pages, a fake API and a tiny model.
+
+**With vs without retrieval** (15 factual questions, measured 2026-11-11). An answer counts as correct when it contains an accepted answer as whole words. "Hit" means that answer appeared in the prompt's passages.
+
+| Model | Without retrieval | With retrieval | Hit |
+|---|---|---|---|
+| MiniLLM 42M base (`checkpoints_local/pretrain`, 512-token context) | 0/15 | 0/15 | 14/15 |
+| SmolLM2-360M-Instruct (`hf:`, reference) | 13/15 | 14/15 | 15/15 |
+
+What this shows:
+
+- **Retrieval works.** The right fact was in the prompt for 14–15 of the 15 questions.
+- **The 42M base model can't use it.** It never saw a question-answer format and isn't trained enough to read the passages.
+- **A model that can read gains from retrieval.** For SmolLM2-360M, retrieval fixed two answers it got wrong without passages: Canberra, and the speed of light.
+
+Remaining misses:
+
+- Wikipedia search never returns the Nile article for "longest river in Africa".
+- The "Eiffel Tower (Paris, Texas)" article outranks the real one. The keyword scoring still counts that answer as correct.
 
 ## Hub repos created
 
